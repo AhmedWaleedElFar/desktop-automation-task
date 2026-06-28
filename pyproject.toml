@@ -1,0 +1,12 @@
+[project]
+name = "desktop-automation-task"
+version = "0.1.0"
+description = "A Python application that uses Computer Vision to dynamically locate and interact with desktop icons on Windows (1920x1080 resolution). The system must find the Notepad icon regardless of its position on the desktop, enabling robust automation even when icon positions change."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mss>=10.2.0",
+    "pillow>=12.2.0",
+    "pyautogui>=0.9.54",
+    "requests>=2.34.2",
+]
