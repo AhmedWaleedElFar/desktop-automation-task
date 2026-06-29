@@ -1,5 +1,6 @@
 import pyautogui
 
 
-pyautogui.click(100, 210, clicks=2, button='left')
+pyautogui.hotkey("win", "d")
+pyautogui.click(944, 406, clicks=2, button='left')
 pyautogui.press('backslash')

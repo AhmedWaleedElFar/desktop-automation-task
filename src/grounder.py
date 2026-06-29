@@ -1,5 +1,5 @@
 """
-Grounding Phase: Use HF-hosted CLIP to precisely locate target app icon within predicted regions.
+Grounding Phase: Use HF-hosted OpenCLIP to precisely locate target app icon within predicted regions.
 No local PyTorch needed - runs entirely via HF Inference API.
 Inspired by ScreenSeekeR's visual grounding stage.
 """
@@ -17,13 +17,13 @@ load_dotenv()
 
 class HFCLIPGrounder:
     """
-    Grounding phase using CLIP via Hugging Face Inference API.
-    No local dependencies - pure API-based.
+    Grounding phase using OpenCLIP via Hugging Face Inference API.
+    No local dependencies - pure API-based zero-shot image classification.
     """
     
     def __init__(self, hf_token: Optional[str] = None):
         """
-        Initialize HF CLIP grounder.
+        Initialize HF OpenCLIP grounder.
         
         Args:
             hf_token: Hugging Face API token. If None, uses HF_TOKEN env var.
@@ -33,7 +33,8 @@ class HFCLIPGrounder:
             raise ValueError("HF_TOKEN not found. Get one from https://huggingface.co/settings/tokens")
         
         self.headers = {"Authorization": f"Bearer {self.hf_token}"}
-        self.clip_api_url = "https://api-inference.huggingface.co/models/openai/clip-vit-base-patch32"
+        # Using a premier OpenCLIP model hosted on HF
+        self.clip_api_url = "https://api-inference.huggingface.co/models/laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
     
     def _image_to_base64(self, image: Image.Image) -> bytes:
         """Convert PIL Image to bytes."""
@@ -48,7 +49,7 @@ class HFCLIPGrounder:
         target_app: str
     ) -> Optional[Tuple[int, int, float]]:
         """
-        Use HF-hosted CLIP to locate icon within candidate regions.
+        Use HF-hosted OpenCLIP to locate icon within candidate regions.
         
         Args:
             screenshot: Full desktop screenshot (PIL Image)
@@ -62,13 +63,14 @@ class HFCLIPGrounder:
         best_match = None
         best_score = 0.0
         
-        print(f"\n🔍 Grounding phase (HF CLIP): Searching {len(candidate_regions)} regions for '{target_app}'")
+        print(f"\n🔍 Grounding phase (HF OpenCLIP): Searching {len(candidate_regions)} regions for '{target_app}'")
         
-        # Text candidates to search for
+        # Text labels for OpenCLIP to evaluate against the crop
         text_descriptions = [
-            f"{target_app} application icon",
-            f"{target_app} app shortcut",
-            f"{target_app} desktop icon",
+            f"a photo of a {target_app} application icon",
+            f"a photo of a {target_app} app shortcut",
+            f"a photo of a {target_app} desktop icon",
+            "a random part of a computer desktop wallpaper or UI",  # Negative constraint label to balance softmax
         ]
         
         # Test each candidate region
@@ -83,35 +85,34 @@ class HFCLIPGrounder:
             try:
                 # Convert image to bytes
                 image_bytes = self._image_to_base64(cropped)
+                base64_image = base64.b64encode(image_bytes).decode("utf-8")
                 
-                # Query HF CLIP API for each text description
-                max_similarity = 0.0
+                # Query HF OpenCLIP API using the standard Zero-Shot Classification payload
+                response = requests.post(
+                    self.clip_api_url,
+                    headers=self.headers,
+                    json={
+                        "image": base64_image,
+                        "parameters": {"candidate_labels": text_descriptions}
+                    },
+                    timeout=30
+                )
                 
-                for text_desc in text_descriptions:
-                    response = requests.post(
-                        self.clip_api_url,
-                        headers=self.headers,
-                        json={
-                            "inputs": {
-                                "text": text_desc,
-                                "image": base64.b64encode(image_bytes).decode()
-                            }
-                        },
-                        timeout=30
-                    )
-                    
-                    if response.status_code != 200:
-                        raise RuntimeError(f"HF API error {response.status_code}: {response.text[:200]}")
-                    
-                    result = response.json()
-                    
-                    # HF CLIP returns logits_per_image
-                    if isinstance(result, list) and len(result) > 0:
-                        similarity = float(result[0])
-                        max_similarity = max(max_similarity, similarity)
+                if response.status_code != 200:
+                    raise RuntimeError(f"HF API error {response.status_code}: {response.text[:200]}")
                 
-                # Convert logits to approximate confidence (0-1)
-                confidence = min(1.0, max(0.0, (max_similarity + 5) / 10))  # Rough scaling
+                result = response.json()
+                
+                # HF zero-shot-image-classification returns a list of items: [{'score': float, 'label': str}, ...]
+                if isinstance(result, list) and len(result) > 0:
+                    # Filter out our negative control label to check true positive confidence
+                    positive_scores = [
+                        item["score"] for item in result 
+                        if item["label"] != "a random part of a computer desktop wallpaper or UI"
+                    ]
+                    confidence = max(positive_scores) if positive_scores else 0.0
+                else:
+                    confidence = 0.0
                 
                 print(f"✓ {confidence:.0%}")
                 
@@ -131,7 +132,7 @@ class HFCLIPGrounder:
             print(f"\n✓ Grounding complete! Found '{target_app}' at ({x}, {y}) with {conf:.0%} confidence")
             return best_match
         else:
-            print(f"\n⚠ CLIP confidence too low ({best_score:.0%}), using heuristic fallback...")
+            print(f"\n⚠ OpenCLIP confidence too low ({best_score:.0%}), using heuristic fallback...")
             return self._heuristic_fallback(candidate_regions)
     
     @staticmethod
@@ -163,18 +164,7 @@ class SimpleHeuristicGrounder:
         candidate_regions: List[List[int]],
         target_app: str
     ) -> Optional[Tuple[int, int, float]]:
-        """
-        Return center of first region (planning confidence).
-        
-        Args:
-            screenshot: Full screenshot (not used)
-            candidate_regions: List of regions
-            target_app: Application name
-        
-        Returns:
-            Center of first region
-        """
-        
+        """Return center of first region."""
         if not candidate_regions:
             return None
         
@@ -195,10 +185,10 @@ class SimpleHeuristicGrounder:
 
 if __name__ == "__main__":
     from screenshot import take_screenshot
-    from planner import DeepSeekPlanner, HeuristicPlanner
+    from planner import GeminiPlanner, HeuristicPlanner
     
     print("=" * 70)
-    print("FULL PIPELINE TEST: Planning (Heuristic) + Grounding (HF CLIP)")
+    print("FULL PIPELINE TEST: Planning (Heuristic) + Grounding (HF OpenCLIP)")
     print("=" * 70)
     
     # Step 1: Capture screenshot
@@ -213,7 +203,7 @@ if __name__ == "__main__":
     # Step 2: Planning phase
     print("\n[2/3] Planning phase...")
     try:
-        planner = DeepSeekPlanner()
+        planner = GeminiPlanner()
         plan = planner.plan_icon_location(screenshot, target_app="Notepad")
         regions = plan["likely_regions"]
     except Exception as e:
