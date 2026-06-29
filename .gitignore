@@ -2,3 +2,4 @@
 .cursor/
 *.png
 __pycache__/
+.env
