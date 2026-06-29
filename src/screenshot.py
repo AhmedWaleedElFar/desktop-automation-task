@@ -20,8 +20,13 @@ def take_screenshot(output_path=None):
 
         pyautogui.hotkey('win', 'd')
         time.sleep(1)
+        # Activate the desktop
 
         screenshot = sct.grab(monitor)
+
+        pyautogui.hotkey('win', 'd')
+        time.sleep(1)
+        # Restore the active window
 
         image = Image.frombytes('RGB', screenshot.size, screenshot.rgb)
 

@@ -1,4 +1,12 @@
-from screenshot import take_screenshot
+import pyautogui
+import time
 
-screenshot = take_screenshot("screenshot.png")
-screenshot.show()
+pyautogui.hotkey('win', 'd')
+time.sleep(1)
+# Activate the desktop
+
+pyautogui.click(250, 250, clicks=2, button='left')
+
+pyautogui.hotkey('win', 'd')
+time.sleep(1)
+# Activate the desktop

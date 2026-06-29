@@ -5,8 +5,10 @@ description = "A Python application that uses Computer Vision to dynamically loc
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "dotenv>=0.9.9",
     "mss>=10.2.0",
     "pillow>=12.2.0",
     "pyautogui>=0.9.54",
+    "pygetwindow>=0.0.9",
     "requests>=2.34.2",
 ]
