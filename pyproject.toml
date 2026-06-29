@@ -8,5 +8,6 @@ dependencies = [
     "mss>=10.2.0",
     "pillow>=12.2.0",
     "pyautogui>=0.9.54",
+    "pygetwindow>=0.0.9",
     "requests>=2.34.2",
 ]
