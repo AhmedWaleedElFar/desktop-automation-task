@@ -1,5 +1,7 @@
 import mss
 from PIL import Image
+import pyautogui
+import time
 
 def take_screenshot(output_path=None):
     """
@@ -16,7 +18,15 @@ def take_screenshot(output_path=None):
         # Index 1 is primary display
         monitor = sct.monitors[1]
 
+        pyautogui.hotkey('win', 'd')
+        time.sleep(1)
+        # Activate the desktop
+
         screenshot = sct.grab(monitor)
+
+        pyautogui.hotkey('win', 'd')
+        time.sleep(1)
+        # Restore the active window
 
         image = Image.frombytes('RGB', screenshot.size, screenshot.rgb)
 
