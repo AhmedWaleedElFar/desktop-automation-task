@@ -33,5 +33,8 @@ def take_screenshot(output_path=None):
         if output_path:
             image.save(output_path)
             print(f"Screenshot saved to {output_path}")
-            
+        
+        pyautogui.hotkey('win', 'd')
+        time.sleep(1)
+
         return image
