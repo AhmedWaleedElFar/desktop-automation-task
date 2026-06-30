@@ -12,9 +12,9 @@ from typing import Optional, Tuple, Dict
 from PIL import Image
 from dataclasses import dataclass
 
-from planner import ClaudePlanner, HeuristicPlanner
-from grounder import ClaudeGrounder, SimpleHeuristicGrounder
-from verifier import ClaudeVerifier, SimpleVerifier
+from planner import GeminiPlanner, HeuristicPlanner
+from grounder import OpenRouterGrounder, SimpleHeuristicGrounder
+from verifier import GeminiVerifier, SimpleVerifier
 from scoring import get_best_region
 
 
@@ -47,7 +47,7 @@ class RecursiveVisualSearcher:
         max_depth: int = 2,
         min_patch_size: int = 1280,
         confidence_threshold: float = 0.6,
-        use_claude: bool = True
+        use_gemini: bool = True
     ):
         """
         Initialize recursive searcher.
@@ -56,18 +56,18 @@ class RecursiveVisualSearcher:
             max_depth: Maximum recursion depth (default 2)
             min_patch_size: Minimum patch size before terminating (pixels, default 1280)
             confidence_threshold: Confidence needed to accept result (0.0-1.0)
-            use_claude: Use Claude API (True) or heuristics only (False)
+            use_gemini: Use Claude API (True) or heuristics only (False)
         """
         self.max_depth = max_depth
         self.min_patch_size = min_patch_size
         self.confidence_threshold = confidence_threshold
-        self.use_claude = use_claude
+        self.use_gemini = use_gemini
         
         # Initialize components
-        if use_claude:
-            self.planner = ClaudePlanner()
-            self.grounder = ClaudeGrounder()
-            self.verifier = ClaudeVerifier()
+        if use_gemini:
+            self.planner = GeminiPlanner()
+            self.grounder = OpenRouterGrounder()
+            self.verifier = GeminiVerifier()
         else:
             self.planner = HeuristicPlanner()
             self.grounder = SimpleHeuristicGrounder()
@@ -263,7 +263,7 @@ if __name__ == "__main__":
             max_depth=2,
             min_patch_size=1280,
             confidence_threshold=0.5,
-            use_claude=True
+            use_gemini=True
         )
         
         result = searcher.search(screenshot, "Find the Notepad application icon")

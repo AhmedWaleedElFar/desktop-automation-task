@@ -1,5 +1,5 @@
 """
-Planning Phase: Use Claude API (vision) to predict likely regions where target app icon is located.
+Planning Phase: Use Gemini 2.5 Flash (vision) to predict likely regions where target app icon is located.
 Inspired by ScreenSeekeR's position inference.
 
 Returns structured JSON with candidate regions, reasoning, and confidence.
@@ -16,44 +16,41 @@ from dotenv import load_dotenv
 load_dotenv()
 
 try:
-    import anthropic
-    ANTHROPIC_AVAILABLE = True
+    from google import genai
+    from google.genai import types
+    GEMINI_AVAILABLE = True
 except ImportError:
-    ANTHROPIC_AVAILABLE = False
-    print("⚠ Warning: anthropic not installed. Install with: uv pip install anthropic")
+    GEMINI_AVAILABLE = False
+    print("⚠ Warning: google-genai not installed. Install with: pip install google-genai")
 
 
-class ClaudePlanner:
+class GeminiPlanner:
     """
-    Planning phase using Claude API (vision) for visual desktop analysis.
-    More reliable than Gemini, no quota issues.
+    Planning phase using Gemini 2.5 Flash (vision) for visual desktop analysis.
+    Leverages Google's permissive free-tier, eliminating quota issues.
     """
     
     def __init__(self, api_key: Optional[str] = None):
         """
-        Initialize Claude planner.
+        Initialize Gemini planner.
         
         Args:
-            api_key: Anthropic API key. If None, uses ANTHROPIC_API_KEY env var.
+            api_key: Gemini API key. If None, uses GEMINI_API_KEY env var.
         """
-        if not ANTHROPIC_AVAILABLE:
-            raise ImportError("anthropic not installed. Run: uv pip install anthropic")
+        if not GEMINI_AVAILABLE:
+            raise ImportError("google-genai not installed. Run: pip install google-genai")
         
-        self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
+        # The genai.Client will naturally look for the GEMINI_API_KEY env variable,
+        # but we pass it explicitly here if custom initialized.
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         if not self.api_key:
-            raise ValueError("ANTHROPIC_API_KEY not found in environment or parameters.")
+            raise ValueError("GEMINI_API_KEY not found in environment or parameters.")
         
-        self.client = anthropic.Anthropic(api_key=self.api_key)
-    
-    def _image_to_base64(self, image: Image.Image) -> str:
-        """Convert PIL Image to base64 string."""
-        buffer = BytesIO()
-        image.save(buffer, format="PNG")
-        return base64.standard_b64encode(buffer.getvalue()).decode("utf-8")
+        self.client = genai.Client(api_key=self.api_key)
     
     def plan_icon_location(self, screenshot: Image.Image, target_app: str) -> Dict:
         """
-        Use Claude API to predict likely regions where target app icon is located.
+        Use Gemini 2.5 Flash API to predict likely regions where target app icon is located.
         
         Args:
             screenshot: PIL Image of desktop (1920x1080)
@@ -67,9 +64,6 @@ class ClaudePlanner:
                 - confidence: Model's confidence (0.0-1.0)
         """
         
-        # Convert image to base64
-        base64_image = self._image_to_base64(screenshot)
-        
         prompt = f"""You are a desktop UI expert analyzing a Windows desktop screenshot (1920x1080 resolution).
 
 Task: Predict where the '{target_app}' application icon is located on this desktop.
@@ -78,9 +72,9 @@ Requirements:
 1. Desktop icons typically appear in corners, edges, or center areas
 2. Analyze the visible desktop layout
 3. Consider common Windows conventions (top-left, top-right, bottom areas, center)
-4. Return ONLY valid JSON, no markdown or extra text
+4. Return ONLY valid JSON conforming to the requested schema. Do not add markdown or backticks.
 
-Respond with ONLY this JSON (no code blocks, no markdown):
+Respond with ONLY this JSON structure:
 {{
     "reasoning": "Brief explanation of why these regions are likely",
     "likely_regions": [
@@ -97,43 +91,29 @@ Notes:
 - Each region is [x1, y1, x2, y2] (top-left to bottom-right)
 - Provide 3-5 candidate regions ranked by likelihood
 - predicted_center is your single best guess
-- confidence is 0.0-1.0 (how sure you are)
-- Return ONLY the JSON object, nothing else"""
+- confidence is 0.0-1.0 (how sure you are)"""
         
         try:
-            response = self.client.messages.create(
-                model="claude-3-5-sonnet-20241022",
-                max_tokens=1024,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": "image/png",
-                                    "data": base64_image
-                                }
-                            },
-                            {
-                                "type": "text",
-                                "text": prompt
-                            }
-                        ]
-                    }
-                ]
+            # We can pass the PIL Image directly inside the content parts list.
+            response = self.client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=[screenshot, prompt],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1,  # Lower temperature helps structure coordinates reliably
+                )
             )
             
-            # Parse response
-            response_text = response.content[0].text.strip()
+            response_text = response.text.strip()
             
-            # Remove markdown code blocks if present
+            # Clean up potential markdown wrapping
             if response_text.startswith("```"):
                 response_text = response_text.split("```")[1]
                 if response_text.startswith("json"):
                     response_text = response_text[4:]
                 response_text = response_text.strip()
+                if response_text.endswith("```"):
+                    response_text = response_text[:-3].strip()
             
             result = json.loads(response_text)
             
@@ -155,7 +135,7 @@ Notes:
                 y2 = max(y1 + 1, min(y2, 1080))
                 result["likely_regions"][i] = [x1, y1, x2, y2]
             
-            print(f"✓ Planning phase complete for '{target_app}' (Claude)")
+            print(f"✓ Planning phase complete for '{target_app}' (Gemini)")
             print(f"  Reasoning: {result['reasoning'][:80]}...")
             print(f"  Confidence: {result['confidence']:.0%}")
             print(f"  Regions: {len(result['likely_regions'])} candidates")
@@ -164,18 +144,18 @@ Notes:
             return result
         
         except json.JSONDecodeError as e:
-            print(f"✗ Failed to parse Claude response as JSON: {e}")
+            print(f"✗ Failed to parse Gemini response as JSON: {e}")
             print(f"Response: {response_text[:300]}")
             raise
         except Exception as e:
-            print(f"✗ Claude API error: {e}")
+            print(f"✗ Gemini API error: {e}")
             raise
 
 
 class HeuristicPlanner:
     """
     Fallback heuristic planner (no API needed).
-    Use when Claude is unavailable or for comparison.
+    Use when Gemini is unavailable or for comparison.
     """
     
     @staticmethod
@@ -208,7 +188,7 @@ class HeuristicPlanner:
             "reasoning": f"Using heuristic desktop layout knowledge for '{target_app}'",
             "likely_regions": [[x1, y1, x2, y2] for x1, y1, x2, y2 in regions],
             "predicted_center": [width // 2, height // 2],
-            "confidence": 0.5,  # Lower confidence than Claude
+            "confidence": 0.5,  # Lower confidence than AI
             "method": "heuristic"
         }
         
@@ -227,7 +207,7 @@ if __name__ == "__main__":
     from screenshot import take_screenshot
     
     print("=" * 70)
-    print("PLANNER TEST - Claude API")
+    print("PLANNER TEST - Gemini 2.5 Flash API")
     print("=" * 70)
     
     # Capture a screenshot
@@ -239,13 +219,13 @@ if __name__ == "__main__":
         print(f"      Error capturing screenshot: {e}")
         exit(1)
     
-    # Test Claude planner
-    print("\n[2/2] Testing Claude Planner...")
+    # Test Gemini planner
+    print("\n[2/2] Testing Gemini Planner...")
     try:
-        planner = ClaudePlanner()
+        planner = GeminiPlanner()
         result = planner.plan_icon_location(img, target_app="Notepad")
         
-        print("\n✓ Claude Planner Result:")
+        print("\n✓ Gemini Planner Result:")
         print(f"  Reasoning: {result['reasoning']}")
         print(f"  Predicted Center: {result['predicted_center']}")
         print(f"  Confidence: {result['confidence']:.0%}")
@@ -260,7 +240,7 @@ if __name__ == "__main__":
         
         print("\n✓ Planner test passed!")
     except Exception as e:
-        print(f"\n✗ Claude Planner failed: {e}")
+        print(f"\n✗ Gemini Planner failed: {e}")
         print("  Falling back to Heuristic...")
         
         heuristic = HeuristicPlanner()

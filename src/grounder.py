@@ -1,6 +1,6 @@
 """
-Grounding Phase: Use Claude API (vision) to precisely locate target app icon within predicted regions.
-Inspired by ScreenSeekeR's visual grounding stage with voting mechanism.
+Grounding Phase: Use Qwen2.5-VL API via OpenRouter to precisely locate the target app icon within predicted regions.
+Inspired by ScreenSeekeR's visual grounding stage with voting mechanisms.
 
 Returns multiple bounding box predictions (voting boxes) for scoring.
 """
@@ -9,47 +9,55 @@ import os
 import json
 import base64
 from io import BytesIO
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Dict
 from PIL import Image
 from dotenv import load_dotenv
 
 load_dotenv()
 
 try:
-    import anthropic
-    ANTHROPIC_AVAILABLE = True
+    import openai
+    OPENAI_AVAILABLE = True
 except ImportError:
-    ANTHROPIC_AVAILABLE = False
-    print("⚠ Warning: anthropic not installed. Install with: uv pip install anthropic")
+    OPENAI_AVAILABLE = False
+    print("⚠ Warning: openai python client not installed. Install with: pip install openai")
 
 
-class ClaudeGrounder:
+class OpenRouterGrounder:
     """
-    Grounding phase using Claude API (vision) to locate target within regions.
-    Returns multiple voting boxes for confidence scoring.
+    Grounding phase using state-of-the-art Qwen2.5-VL models on OpenRouter.
+    Provides pixel-precise visual grounding utilizing multiple voting boxes.
     """
     
     def __init__(self, api_key: Optional[str] = None):
         """
-        Initialize Claude grounder.
+        Initialize OpenRouter Grounder.
         
         Args:
-            api_key: Anthropic API key. If None, uses ANTHROPIC_API_KEY env var.
+            api_key: OpenRouter API key. If None, uses OPENROUTER_API_KEY env var.
         """
-        if not ANTHROPIC_AVAILABLE:
-            raise ImportError("anthropic not installed. Run: uv pip install anthropic")
+        if not OPENAI_AVAILABLE:
+            raise ImportError("openai SDK is required. Run: pip install openai")
         
-        self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
+        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
         if not self.api_key:
-            raise ValueError("ANTHROPIC_API_KEY not found. Get one from Anthropic console.")
+            raise ValueError("OPENROUTER_API_KEY not found. Please set it in your .env file.")
         
-        self.client = anthropic.Anthropic(api_key=self.api_key)
+        # OpenRouter uses the OpenAI-compatible SDK structure
+        self.client = openai.OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=self.api_key,
+        )
+        
+        # Best visual grounding model option
+        self.model = "qwen/qwen-2.5-vl-72b-instruct"
     
-    def _image_to_base64(self, image: Image.Image) -> str:
-        """Convert PIL Image to base64 string."""
+    def _image_to_base64_data_uri(self, image: Image.Image) -> str:
+        """Convert PIL Image to a base64 Data URI."""
         buffer = BytesIO()
         image.save(buffer, format="PNG")
-        return base64.standard_b64encode(buffer.getvalue()).decode("utf-8")
+        base64_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
+        return f"data:image/png;base64,{base64_str}"
     
     def ground_icon_in_regions(
         self,
@@ -58,8 +66,7 @@ class ClaudeGrounder:
         target_app: str
     ) -> Optional[Dict]:
         """
-        Use Claude API to locate icon within candidate regions.
-        Returns voting boxes (multiple predictions) for scoring.
+        Use Qwen2.5-VL to locate target icon inside candidate regions.
         
         Args:
             screenshot: Full desktop screenshot (PIL Image)
@@ -68,76 +75,76 @@ class ClaudeGrounder:
         
         Returns:
             Dict with:
-                - center: (x, y) best prediction
-                - confidence: 0.0-1.0
-                - voting_boxes: List of candidate boxes for scoring
+                - reasoning: Explanation of visual selection
+                - voting_boxes: List of predicted bounding boxes with confidence and region mapping
+                - best_center: [x, y] coordinates of the single best prediction
+                - overall_confidence: Overall score (0.0-1.0)
         """
         
-        base64_image = self._image_to_base64(screenshot)
+        # Prepare image data
+        image_data_uri = self._image_to_base64_data_uri(screenshot)
         
-        # Build region descriptions
+        # Format region lists
         region_descriptions = "\n".join([
-            f"Region {i}: [{x1}, {y1}, {x2}, {y2}]"
+            f"- Region {i}: [{x1}, {y1}, {x2}, {y2}]"
             for i, (x1, y1, x2, y2) in enumerate(candidate_regions)
         ])
         
-        prompt = f"""You are a visual grounding expert. Your task is to locate the exact position of a '{target_app}' icon on this desktop screenshot (1920x1080).
+        prompt = f"""You are a pixel-level visual grounding assistant specializing in GUI automation.
+Your task is to locate the exact bounding box of the '{target_app}' application icon on this desktop (1920x1080 resolution).
 
-Here are candidate regions where it might be located:
+We have narrowed down the search area to these candidate regions:
 {region_descriptions}
 
-Task: For each candidate region, predict the bounding box of the '{target_app}' icon if it exists there.
+Task instructions:
+1. Scan the candidate regions in the provided image.
+2. Predict the exact coordinate bounding boxes [x1, y1, x2, y2] for the '{target_app}' icon if you see it.
+3. Supply multiple localized bounding boxes ("voting boxes") around the target to help rank and score candidates.
+4. Output your answer in the requested structured JSON layout.
 
-Return ONLY this JSON (no markdown or code blocks):
+Respond with ONLY raw, valid JSON conforming to this structure:
 {{
-    "reasoning": "Why you think the icon is in these locations",
+    "reasoning": "Reasoning about icon detections in regions",
     "voting_boxes": [
         {{"box": [x1, y1, x2, y2], "confidence": 0.95, "region": 0}},
-        {{"box": [x1, y1, x2, y2], "confidence": 0.92, "region": 0}},
-        {{"box": [x1, y1, x2, y2], "confidence": 0.85, "region": 1}}
+        {{"box": [x1, y1, x2, y2], "confidence": 0.88, "region": 0}}
     ],
     "best_center": [x, y],
-    "overall_confidence": 0.85
+    "overall_confidence": 0.92
 }}
 
 Notes:
-- voting_boxes: List of 5-10 predicted bounding boxes (votes)
-- Each box is [x1, y1, x2, y2] in pixel coordinates
-- confidence: How certain you are about this specific box (0.0-1.0)
-- region: Which candidate region this box is from
-- best_center: The [x, y] center of your single best prediction
-- overall_confidence: Overall confidence in finding the target (0.0-1.0)
-- Return ONLY JSON, nothing else"""
-        
+- Output only valid JSON. Do not write markdown blocks, "```json", or extra preamble text.
+- Coordinates must be within pixel bounds (1920 x 1080 resolution).
+- The "best_center" should be your single highest-likelihood click point [x, y]."""
+
         try:
-            response = self.client.messages.create(
-                model="claude-3-5-sonnet-20241022",
-                max_tokens=1024,
+            response = self.client.chat.completions.create(
+                model=self.model,
                 messages=[
                     {
                         "role": "user",
                         "content": [
                             {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": "image/png",
-                                    "data": base64_image
-                                }
-                            },
-                            {
                                 "type": "text",
                                 "text": prompt
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": image_data_uri
+                                }
                             }
                         ]
                     }
-                ]
+                ],
+                temperature=0.1,
+                max_tokens=1000,
             )
             
-            # Parse response
-            response_text = response.content[0].text.strip()
+            response_text = response.choices[0].message.content.strip()
             
-            # Remove markdown
+            # Clean markdown JSON wraps if present
             if response_text.startswith("```"):
                 response_text = response_text.split("```")[1]
                 if response_text.startswith("json"):
@@ -146,12 +153,12 @@ Notes:
             
             result = json.loads(response_text)
             
-            # Validate
+            # Validate output keys
             required_keys = ["reasoning", "voting_boxes", "best_center", "overall_confidence"]
             if not all(k in result for k in required_keys):
-                raise ValueError(f"Missing required keys. Got: {list(result.keys())}")
+                raise ValueError(f"Missing required keys in response schema: {list(result.keys())}")
             
-            # Clamp coordinates
+            # Coordinate bounding clamp
             for box_data in result["voting_boxes"]:
                 x1, y1, x2, y2 = box_data["box"]
                 x1 = max(0, min(x1, 1920))
@@ -159,58 +166,38 @@ Notes:
                 y1 = max(0, min(y1, 1080))
                 y2 = max(y1 + 1, min(y2, 1080))
                 box_data["box"] = [x1, y1, x2, y2]
-            
-            print(f"✓ Grounding phase complete for '{target_app}' (Claude)")
+                
+            print(f"✓ Grounding phase complete for '{target_app}' (Qwen2.5-VL)")
             print(f"  Reasoning: {result['reasoning'][:80]}...")
-            print(f"  Overall confidence: {result['overall_confidence']:.0%}")
-            print(f"  Voting boxes: {len(result['voting_boxes'])} predictions")
-            print(f"  Best center: {result['best_center']}")
+            print(f"  Voting boxes: {len(result['voting_boxes'])} bounding-box records")
+            print(f"  Best center click point: {result['best_center']}")
             
             return result
-        
+            
         except json.JSONDecodeError as e:
-            print(f"✗ Failed to parse Claude response as JSON: {e}")
-            print(f"Response: {response_text[:300]}")
+            print(f"✗ Failed to parse OpenRouter response: {e}")
+            print(f"Raw Output: {response_text[:350]}")
             raise
         except Exception as e:
-            print(f"✗ Claude grounder error: {e}")
+            print(f"✗ OpenRouter grounder error: {e}")
             raise
 
 
 class SimpleHeuristicGrounder:
-    """
-    Ultra-simple fallback: No API calls needed.
-    Just return center of best region from planning.
-    """
-    
+    """Fallback heuristic grounder (no API needed)."""
     @staticmethod
-    def ground_icon_in_regions(
-        screenshot: Image.Image,
-        candidate_regions: List[List[int]],
-        target_app: str
-    ) -> Optional[Dict]:
-        """Return center of first region."""
+    def ground_icon_in_regions(screenshot: Image.Image, candidate_regions: List[List[int]], target_app: str) -> Optional[Dict]:
         if not candidate_regions:
             return None
-        
-        print(f"\n📍 Grounding phase (Heuristic): Using best-predicted region for '{target_app}'")
-        
         x1, y1, x2, y2 = candidate_regions[0]
         center_x = (x1 + x2) // 2
         center_y = (y1 + y2) // 2
-        
-        result = {
+        return {
             "reasoning": "Heuristic fallback: using center of best-predicted region",
-            "voting_boxes": [
-                {"box": [x1, y1, x2, y2], "confidence": 0.5, "region": 0}
-            ],
+            "voting_boxes": [{"box": [x1, y1, x2, y2], "confidence": 0.5, "region": 0}],
             "best_center": [center_x, center_y],
             "overall_confidence": 0.5
         }
-        
-        print(f"  Result: ({center_x}, {center_y}) with 50% confidence")
-        
-        return result
 
 
 # ============================================================================
@@ -219,10 +206,10 @@ class SimpleHeuristicGrounder:
 
 if __name__ == "__main__":
     from screenshot import take_screenshot
-    from planner import ClaudePlanner, HeuristicPlanner
+    from planner import GeminiPlanner, HeuristicPlanner
     
     print("=" * 70)
-    print("GROUNDER TEST - Claude API with Voting Mechanism")
+    print("GROUNDER TEST - Qwen API with Voting Mechanism")
     print("=" * 70)
     
     # Step 1: Capture screenshot
@@ -237,12 +224,12 @@ if __name__ == "__main__":
     # Step 2: Planning phase
     print("\n[2/3] Planning phase...")
     try:
-        planner = ClaudePlanner()
+        planner = GeminiPlanner()
         plan = planner.plan_icon_location(screenshot, target_app="Notepad")
         regions = plan["likely_regions"]
         print(f"      Got {len(regions)} candidate regions")
     except Exception as e:
-        print(f"      Claude planner failed: {e}")
+        print(f"      Gemini planner failed: {e}")
         print("      Using heuristic planning...")
         planner = HeuristicPlanner()
         plan = planner.plan_icon_location(screenshot, target_app="Notepad")
@@ -251,7 +238,7 @@ if __name__ == "__main__":
     # Step 3: Grounding phase
     print("\n[3/3] Grounding phase...")
     try:
-        grounder = ClaudeGrounder()
+        grounder = OpenRouterGrounder()
         result = grounder.ground_icon_in_regions(screenshot, regions, target_app="Notepad")
         
         if result:
