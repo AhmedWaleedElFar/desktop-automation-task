@@ -83,15 +83,15 @@ def run_search_test():
         
         print("\n[2/2] Running recursive search...")
         
-        # Try Claude first, fallback to heuristics
+        # Try Gemini first, fallback to heuristics
         try:
-            searcher = RecursiveVisualSearcher(use_claude=True)
-            print("      Using Claude API")
+            searcher = RecursiveVisualSearcher()
+            print("      Using Gemini API")
         except:
-            print("      Claude API unavailable, using heuristics")
-            searcher = RecursiveVisualSearcher(use_claude=False)
+            print("      Gemini API unavailable, using heuristics")
+            searcher = RecursiveVisualSearcher()
         
-        result = searcher.search(screenshot, "Find the Notepad application icon")
+        result = searcher.search(screenshot, "Notepad")
         
         print(f"\n{'='*80}")
         print("SEARCH RESULT")
@@ -138,11 +138,11 @@ def run_automation(num_posts: int = 10):
         
         # Try Claude first, fallback to heuristics
         try:
-            automaton = DesktopAutomation(use_claude=True)
+            automaton = DesktopAutomation()
             print("Using Claude API for grounding")
         except:
             print("Claude API unavailable, using heuristics")
-            automaton = DesktopAutomation(use_claude=False)
+            automaton = DesktopAutomation(use_gemini=False)
         
         stats = automaton.run_full_automation(num_posts=num_posts)
         

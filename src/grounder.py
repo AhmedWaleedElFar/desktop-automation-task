@@ -90,33 +90,30 @@ class OpenRouterGrounder:
             for i, (x1, y1, x2, y2) in enumerate(candidate_regions)
         ])
         
+        # Inside grounder.py (ground_icon_in_regions method)
+        width, height = screenshot.size
+
         prompt = f"""You are a pixel-level visual grounding assistant specializing in GUI automation.
-Your task is to locate the exact bounding box of the '{target_app}' application icon on this desktop (1920x1080 resolution).
+        Your task is to locate the exact bounding box of the '{target_app}' icon within this provided image patch.
+        The exact canvas resolution is {width}x{height} pixels.
 
-We have narrowed down the search area to these candidate regions:
-{region_descriptions}
+        We have narrowed down the search area to these candidate regions:
+        {region_descriptions}
 
-Task instructions:
-1. Scan the candidate regions in the provided image.
-2. Predict the exact coordinate bounding boxes [x1, y1, x2, y2] for the '{target_app}' icon if you see it.
-3. Supply multiple localized bounding boxes ("voting boxes") around the target to help rank and score candidates.
-4. Output your answer in the requested structured JSON layout.
+        Task instructions:
+        1. Scan the candidate regions in the provided image.
+        2. Predict the exact coordinate bounding boxes [x1, y1, x2, y2] relative to this image space.
+        3. Coordinates must strictly reside within pixel bounds (0 to {width} width, 0 to {height} height).
 
-Respond with ONLY raw, valid JSON conforming to this structure:
-{{
-    "reasoning": "Reasoning about icon detections in regions",
-    "voting_boxes": [
-        {{"box": [x1, y1, x2, y2], "confidence": 0.95, "region": 0}},
-        {{"box": [x1, y1, x2, y2], "confidence": 0.88, "region": 0}}
-    ],
-    "best_center": [x, y],
-    "overall_confidence": 0.92
-}}
-
-Notes:
-- Output only valid JSON. Do not write markdown blocks, "```json", or extra preamble text.
-- Coordinates must be within pixel bounds (1920 x 1080 resolution).
-- The "best_center" should be your single highest-likelihood click point [x, y]."""
+        Respond with ONLY raw, valid JSON conforming to this structure:
+        {{
+            "reasoning": "Reasoning about icon detections",
+            "voting_boxes": [
+                {{"box": [x1, y1, x2, y2], "confidence": 0.95, "region": 0}}
+            ],
+            "best_center": [x, y],
+            "overall_confidence": 0.92
+        }}"""
 
         try:
             response = self.client.chat.completions.create(

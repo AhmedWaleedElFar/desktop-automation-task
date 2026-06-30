@@ -1,26 +1,21 @@
 """
-Recursive Visual Search: Main VISUALSEARCH algorithm from ScreenSeekeR paper.
-
-Depth-based search with:
-- Planning phase (predicts candidate regions)
-- Grounding phase (locates within regions using voting)
-- Verification phase (confirms if target found)
-- Recursion (zooms into best region if uncertain)
+Recursive Visual Search Coordinator Engine entirely mapped over Qwen.
 """
 
-from typing import Optional, Tuple, Dict
-from PIL import Image
+import os
+import traceback
+from typing import Optional, Tuple, List, Dict
+from PIL import Image, ImageDraw
 from dataclasses import dataclass
 
-from planner import GeminiPlanner, HeuristicPlanner
+from planner import QwenPlanner, HeuristicPlanner
 from grounder import OpenRouterGrounder, SimpleHeuristicGrounder
-from verifier import GeminiVerifier, SimpleVerifier
+from verifier import QwenVerifier, SimpleVerifier
 from scoring import get_best_region
 
 
 @dataclass
 class SearchResult:
-    """Result of visual search."""
     found: bool
     center: Tuple[int, int]
     confidence: float
@@ -30,54 +25,40 @@ class SearchResult:
 
 
 class RecursiveVisualSearcher:
-    """
-    ScreenSeekeR-inspired recursive visual search for UI elements.
-    
-    Algorithm:
-    1. Plan: Predict candidate regions (planning model)
-    2. Ground: Locate within regions using voting boxes (grounding model)
-    3. Score: Rank regions by Gaussian centrality (scoring algorithm)
-    4. Verify: Confirm target matches instruction (verification model)
-    5. Recurse: If uncertain, crop best region and retry at deeper level
-    6. Terminate: When found OR depth exceeded OR box too small
-    """
     
     def __init__(
         self,
         max_depth: int = 2,
-        min_patch_size: int = 1280,
-        confidence_threshold: float = 0.6,
-        use_gemini: bool = True
+        min_patch_size: int = 100,
+        confidence_threshold: float = 0.5,
+        log_dir: str = "logs"
     ):
-        """
-        Initialize recursive searcher.
-        
-        Args:
-            max_depth: Maximum recursion depth (default 2)
-            min_patch_size: Minimum patch size before terminating (pixels, default 1280)
-            confidence_threshold: Confidence needed to accept result (0.0-1.0)
-            use_gemini: Use Claude API (True) or heuristics only (False)
-        """
         self.max_depth = max_depth
         self.min_patch_size = min_patch_size
         self.confidence_threshold = confidence_threshold
-        self.use_gemini = use_gemini
         
-        # Initialize components
-        if use_gemini:
-            self.planner = GeminiPlanner()
-            self.grounder = OpenRouterGrounder()
-            self.verifier = GeminiVerifier()
-        else:
-            self.planner = HeuristicPlanner()
-            self.grounder = SimpleHeuristicGrounder()
-            self.verifier = SimpleVerifier()
+        self.planner_log_dir = os.path.join(log_dir, "planner_regions")
+        self.grounder_log_dir = os.path.join(log_dir, "grounder_boxes")
+        os.makedirs(self.planner_log_dir, exist_ok=True)
+        os.makedirs(self.grounder_log_dir, exist_ok=True)
         
-        # Fallbacks
+        # Instantiate pure Qwen vision components
+        self.planner = QwenPlanner()
+        self.grounder = OpenRouterGrounder()
+        self.verifier = QwenVerifier()
+            
         self.heuristic_planner = HeuristicPlanner()
         self.heuristic_grounder = SimpleHeuristicGrounder()
         self.heuristic_verifier = SimpleVerifier()
-    
+
+    def _save_annotated_image(self, base_img: Image.Image, boxes: List[List[int]], output_path: str):
+        annotated = base_img.copy()
+        draw = ImageDraw.Draw(annotated)
+        for i, box in enumerate(boxes):
+            draw.rectangle(box, outline="red", width=2)
+            draw.text((box[0] + 2, box[1] + 2), f"#{i}", fill="red")
+        annotated.save(output_path)
+
     def search(
         self,
         screenshot: Image.Image,
@@ -85,153 +66,90 @@ class RecursiveVisualSearcher:
         depth: int = 0,
         parent_box: Optional[Tuple[int, int, int, int]] = None
     ) -> SearchResult:
-        """
-        Recursive visual search for target element.
         
-        Args:
-            screenshot: Current screenshot (may be cropped at deeper levels)
-            instruction: Target description (e.g., "Find Notepad icon")
-            depth: Current recursion depth
-            parent_box: Parent region coordinates (for coordinate mapping)
-        
-        Returns:
-            SearchResult with found status, coordinates, confidence
-        """
-        
-        # Termination condition 1: Max depth exceeded
         if depth > self.max_depth:
-            return SearchResult(
-                found=False,
-                center=(0, 0),
-                confidence=0.0,
-                bounding_box=(0, 0, 0, 0),
-                depth=depth,
-                reasoning="Max recursion depth exceeded"
-            )
+            return SearchResult(False, (0,0), 0.0, (0,0,0,0), depth, "Max tracking depth recursion exceeded.")
+            
+        w, h = screenshot.size
+        if (w * h) < self.min_patch_size:
+            return SearchResult(False, (0,0), 0.0, (0,0,0,0), depth, f"Patch canvas area dropped below operational bounds.")
+            
+        print(f"\n============== [DEPTH {depth} - QWEN RESOLUTION: {w}x{h}] ==============")
         
-        # Termination condition 2: Patch too small
-        if screenshot.size[0] * screenshot.size[1] < self.min_patch_size:
-            return SearchResult(
-                found=False,
-                center=(0, 0),
-                confidence=0.0,
-                bounding_box=(0, 0, 0, 0),
-                depth=depth,
-                reasoning=f"Patch size {screenshot.size[0]}x{screenshot.size[1]} below minimum"
-            )
-        
-        print(f"\n{'='*70}")
-        print(f"[DEPTH {depth}] Searching for: {instruction}")
-        print(f"Screenshot size: {screenshot.size}")
-        print(f"{'='*70}")
-        
+        # PHASE 1: PLANNING (QWEN)
         try:
-            # PHASE 1: PLANNING - Predict candidate regions
-            print(f"\n[PHASE 1] Planning...")
-            try:
-                plan = self.planner.plan_icon_location(screenshot, instruction)
-            except Exception as e:
-                print(f"  Planner failed: {e}, using heuristic...")
-                plan = self.heuristic_planner.plan_icon_location(screenshot, instruction)
-            
-            candidate_regions = plan["likely_regions"]
-            planning_confidence = plan["confidence"]
-            
-            # PHASE 2: GROUNDING - Locate within regions using voting
-            print(f"\n[PHASE 2] Grounding...")
-            try:
-                grounding = self.grounder.ground_icon_in_regions(
-                    screenshot, candidate_regions, instruction
-                )
-            except Exception as e:
-                print(f"  Grounder failed: {e}, using heuristic...")
-                grounding = self.heuristic_grounder.ground_icon_in_regions(
-                    screenshot, candidate_regions, instruction
-                )
-            
-            voting_boxes = grounding["voting_boxes"]
-            grounding_confidence = grounding["overall_confidence"]
-            
-            # PHASE 3: SCORING - Rank regions by voting box centrality
-            print(f"\n[PHASE 3] Scoring regions...")
-            best_idx, best_score, best_region = get_best_region(
-                voting_boxes, candidate_regions, sigma=0.3, use_nms=True
-            )
-            print(f"  Best region index: {best_idx}")
-            print(f"  Best region: {best_region}")
-            print(f"  Best score: {best_score:.3f}")
-            
-            # Get center of best region
-            x1, y1, x2, y2 = best_region
-            center_x = (x1 + x2) // 2
-            center_y = (y1 + y2) // 2
-            
-            # Map to parent coordinates if needed
-            if parent_box:
-                parent_x1, parent_y1, _, _ = parent_box
-                center_x += parent_x1
-                center_y += parent_y1
-                best_region = (
-                    x1 + parent_x1,
-                    y1 + parent_y1,
-                    x2 + parent_x1,
-                    y2 + parent_y1
-                )
-            
-            combined_confidence = (planning_confidence + grounding_confidence + best_score) / 3
-            
-            # PHASE 4: VERIFICATION - Confirm target matches instruction
-            print(f"\n[PHASE 4] Verification...")
-            cropped = screenshot.crop(best_region)
-            try:
-                is_target, refined_instr = self.verifier.verify_target(cropped, instruction)
-            except Exception as e:
-                print(f"  Verifier failed: {e}, using heuristic...")
-                is_target, refined_instr = self.heuristic_verifier.verify_target(
-                    cropped, instruction
-                )
-            
-            # SUCCESS: Target found with high confidence
-            if is_target and combined_confidence >= self.confidence_threshold:
-                print(f"\n✅ TARGET FOUND at depth {depth}!")
-                print(f"   Center: ({center_x}, {center_y})")
-                print(f"   Confidence: {combined_confidence:.0%}")
-                
-                return SearchResult(
-                    found=True,
-                    center=(center_x, center_y),
-                    confidence=combined_confidence,
-                    bounding_box=best_region,
-                    depth=depth,
-                    reasoning=f"Found and verified at depth {depth}"
-                )
-            
-            # LOW CONFIDENCE: Try deeper recursion
-            if not is_target or combined_confidence < self.confidence_threshold:
-                print(f"\n⚠️  Confidence too low ({combined_confidence:.0%}), recursing...")
-                print(f"   Refined instruction: {refined_instr}")
-                
-                # Crop best region and recurse
-                cropped_screenshot = screenshot.crop(best_region)
-                parent_coords = best_region
-                
-                return self.search(
-                    cropped_screenshot,
-                    refined_instr,
-                    depth=depth + 1,
-                    parent_box=parent_coords
-                )
-        
+            plan = self.planner.plan_icon_location(screenshot, instruction)
+            print(f"✓ Qwen Planner isolated target likelihood neighborhoods.")
         except Exception as e:
-            print(f"\n❌ Search error at depth {depth}: {e}")
-            return SearchResult(
-                found=False,
-                center=(0, 0),
-                confidence=0.0,
-                bounding_box=(0, 0, 0, 0),
-                depth=depth,
-                reasoning=f"Error: {str(e)}"
-            )
+            print(f"⚠️ Qwen Planner Exception encountered: {e}")
+            traceback.print_exc()
+            plan = self.heuristic_planner.plan_icon_location(screenshot, instruction)
+            
+        candidate_regions = plan["likely_regions"]
+        
+        planner_img_path = os.path.join(self.planner_log_dir, f"depth_{depth}_regions.png")
+        self._save_annotated_image(screenshot, candidate_regions, planner_img_path)
+        
+        # PHASE 2: GROUNDING (QWEN)
+        try:
+            grounding = self.grounder.ground_icon_in_regions(screenshot, candidate_regions, instruction)
+            print(f"✓ Qwen Grounder extracted precise spatial voting frames.")
+        except Exception as e:
+            print(f"⚠️ Qwen Grounder Exception encountered: {e}")
+            traceback.print_exc()
+            grounding = self.heuristic_grounder.ground_icon_in_regions(screenshot, candidate_regions, instruction)
+            
+        voting_boxes = grounding["voting_boxes"]
+        
+        grounder_img_path = os.path.join(self.grounder_log_dir, f"depth_{depth}_voting_boxes.png")
+        self._save_annotated_image(screenshot, [vb["box"] for vb in voting_boxes], grounder_img_path)
+        
+        # PHASE 3: SCORING (GAUSSIAN CENTRALITY)
+        best_idx, best_score, best_region = get_best_region(voting_boxes, candidate_regions, sigma=0.3, use_nms=True)
+        print(f"--> Ranked Region #{best_idx} best with density score: {best_score:.3f}")
+        
+        rx1, ry1, rx2, ry2 = best_region
+        local_cx = (rx1 + rx2) // 2
+        local_cy = (ry1 + ry2) // 2
+        
+        # Extract the focused crop sub-canvas
+        cropped_patch = screenshot.crop((rx1, ry1, rx2, ry2))
+        
+        # PHASE 4: VERIFICATION (QWEN)
+        try:
+            is_target, refined_instr = self.verifier.verify_target(cropped_patch, instruction)
+            print(f"✓ Qwen Verification completed. target_match status: {is_target}")
+        except Exception as e:
+            print(f"⚠️ Qwen Verifier exception: {e}")
+            is_target, refined_instr = self.heuristic_verifier.verify_target(cropped_patch, instruction)
+            
+        # Reconstruct tracking matrix up to true display space coordinates
+        global_x = local_cx
+        global_y = local_cy
+        global_box = [rx1, ry1, rx2, ry2]
+        
+        if parent_box:
+            global_x += parent_box[0]
+            global_y += parent_box[1]
+            global_box = [
+                rx1 + parent_box[0],
+                ry1 + parent_box[1],
+                rx2 + parent_box[0],
+                ry2 + parent_box[1]
+            ]
+            
+        combined_confidence = (plan["confidence"] + grounding["overall_confidence"]) / 2
+        if is_target and combined_confidence >= self.confidence_threshold:
+            print(f"🎯 Target confirmed at Location Hook: ({global_x}, {global_y})")
+            return SearchResult(True, (global_x, global_y), combined_confidence, tuple(global_box), depth, "Target found and verified by Qwen engine.")
+            
+        print(f"📉 Low match confidence or verification flagged false. Processing deeper recursion search tier...")
+        return self.search(
+            screenshot=cropped_patch,
+            instruction=refined_instr,
+            depth=depth + 1,
+            parent_box=tuple(global_box)
+        )
 
 
 # ============================================================================
@@ -258,12 +176,11 @@ if __name__ == "__main__":
     print("\n[2/2] Running recursive visual search...")
     
     try:
-        # Use Claude if available, otherwise fallback to heuristics
+        # Use gemini if available, otherwise fallback to heuristics
         searcher = RecursiveVisualSearcher(
             max_depth=2,
             min_patch_size=1280,
-            confidence_threshold=0.5,
-            use_gemini=True
+            confidence_threshold=0.5
         )
         
         result = searcher.search(screenshot, "Find the Notepad application icon")

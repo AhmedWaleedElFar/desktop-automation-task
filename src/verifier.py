@@ -1,8 +1,5 @@
 """
-Verification Phase: Confirm that detected element matches the instruction.
-Inspired by ScreenSeekeR's result verification step.
-
-After grounding, ask the planner: "Is this actually the target?"
+Verification Phase: Confirm that the selected cropped region contains the target element.
 """
 
 import json
@@ -10,115 +7,84 @@ import os
 import base64
 from io import BytesIO
 from PIL import Image
-from typing import Dict, Optional, Tuple
+from typing import Tuple, Optional
 from dotenv import load_dotenv
 
 load_dotenv()
 
 try:
-    from google import genai
-    from google.genai import types
-    GEMINI_AVAILABLE = True
+    import openai
+    OPENAI_AVAILABLE = True
 except ImportError:
-    GEMINI_AVAILABLE = False
-    print("⚠ Warning: google-genai not installed.")
+    OPENAI_AVAILABLE = False
 
 
-class GeminiVerifier:
-    """
-    Verification phase using Gemini API to verify if detected element matches instruction.
-    """
+class QwenVerifier:
+    """Precision verification system driven by Qwen2.5-VL."""
     
     def __init__(self, api_key: Optional[str] = None):
-        """
-        Initialize Gemini verifier.
-        
-        Args:
-            api_key: Google Gemini API key. If None, uses GEMINI_API_KEY env var.
-        """
-        if not GEMINI_AVAILABLE:
-            raise ImportError("google-genai not installed. Run: pip install google-genai")
-        
-        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
-        if not self.api_key:
-            raise ValueError("GEMINI_API_KEY not found.")
-        
-        self.client = genai.Client(api_key=self.api_key)
-    
-    def verify_target(
-        self,
-        cropped_screenshot: Image.Image,
-        instruction: str
-    ) -> Tuple[bool, str]:
-        """
-        Verify if the cropped screenshot contains the target element.
-        
-        Args:
-            cropped_screenshot: PIL Image of the detected region (cropped)
-            instruction: Target description (e.g., "Notepad icon")
-        
-        Returns:
-            Tuple of (is_target: bool, refined_instruction: str)
-            - is_target: True if this is the target, False otherwise
-            - refined_instruction: Clearer version of instruction if target not found
-        """
-        
-        prompt = f"""You are a visual verification expert.
+        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
+        if OPENAI_AVAILABLE and self.api_key:
+            self.client = openai.OpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=self.api_key
+            )
+        else:
+            self.client = None
 
-Instruction: {instruction}
+    def verify_target(self, cropped_image: Image.Image, instruction: str) -> Tuple[bool, str]:
+        if not self.client:
+            raise ValueError("OpenRouter client is uninitialized.")
+            
+        # Reject uninitialized or pitch-black crops immediately to avoid API loops
+        extrema = cropped_image.convert("L").getextrema()
+        if extrema == (0, 0):
+            return False, instruction
 
-Look at this cropped screenshot. Your task is to determine if it contains the target described in the instruction.
+        prompt = f"""You are a QA verification engine validating desktop user interface crops.
+Task: Inspect this cropped visual element image patch and determine if it matches or contains the item: '{instruction}'.
 
-Analyze the screenshot and respond with ONLY this JSON. Do not output markdown code blocks.
+Instructions:
+1. Respond with "is_target" true only if the specified element is cleanly visible.
+2. If the patch contains the icon but it is blurry, text-only, or off-center, you can modify 'refined_instruction'.
+3. If it is a completely different element, or empty/black space, return false.
+4. Output raw valid JSON matching the template below. No markdown wrapping.
 
-Schema:
+Required JSON Structure:
 {{
-    "result": "is_target" | "target_elsewhere" | "target_not_found",
-    "reasoning": "Brief explanation of your analysis",
-    "new_instruction": "A clearer/more specific version of the instruction if needed (null if not needed)"
-}}
+    "reasoning": "Visual proof analysis confirming identity.",
+    "is_target": true,
+    "refined_instruction": "{instruction}"
+}}"""
 
-result values:
-- "is_target": The cropped region contains the target element
-- "target_elsewhere": The target exists in the full screenshot but not in this crop
-- "target_not_found": The target does not appear to exist"""
-        
-        try:
-            config = types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.1
-            )
-            
-            response = self.client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[cropped_screenshot, prompt],
-                config=config
-            )
-            
-            response_text = response.text.strip()
-            result = json.loads(response_text)
-            
-            # Validate output keys and values
-            valid_results = ["is_target", "target_elsewhere", "target_not_found"]
-            if "result" not in result or result["result"] not in valid_results:
-                raise ValueError(f"Invalid result: {result.get('result')}")
-            
-            is_target = (result["result"] == "is_target")
-            new_instruction = result.get("new_instruction") or instruction
-            
-            print(f"✓ Verification: {result['result']}")
-            print(f"  Reasoning: {result['reasoning'][:80]}...")
-            
-            return is_target, new_instruction
-        
-        except json.JSONDecodeError as e:
-            print(f"✗ Failed to parse verifier response as JSON: {e}")
-            print(f"Response: {response_text[:300]}")
-            raise
-        except Exception as e:
-            print(f"✗ Verification error: {e}")
-            raise
+        buffered = BytesIO()
+        cropped_image.save(buffered, format="PNG")
+        img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
+        response = self.client.chat.completions.create(
+            model="qwen/qwen-2.5-vl-72b-instruct",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_base64}"}}
+                    ]
+                }
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.1,
+            max_tokens=1000
+        )
+
+        text = response.choices[0].message.content.strip()
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+                
+        data = json.loads(text)
+        return bool(data.get("is_target", False)), str(data.get("refined_instruction", instruction))
 
 class SimpleVerifier:
     """

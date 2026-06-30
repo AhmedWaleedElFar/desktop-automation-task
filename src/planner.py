@@ -1,8 +1,5 @@
 """
-Planning Phase: Use Gemini 2.5 Flash (vision) to predict likely regions where target app icon is located.
-Inspired by ScreenSeekeR's position inference.
-
-Returns structured JSON with candidate regions, reasoning, and confidence.
+Planning Phase: Use Qwen2.5-VL via OpenRouter to predict likely application regions.
 """
 
 import json
@@ -16,141 +13,92 @@ from dotenv import load_dotenv
 load_dotenv()
 
 try:
-    from google import genai
-    from google.genai import types
-    GEMINI_AVAILABLE = True
+    import openai
+    OPENAI_AVAILABLE = True
 except ImportError:
-    GEMINI_AVAILABLE = False
-    print("⚠ Warning: google-genai not installed. Install with: pip install google-genai")
+    OPENAI_AVAILABLE = False
 
 
-class GeminiPlanner:
-    """
-    Planning phase using Gemini 2.5 Flash (vision) for visual desktop analysis.
-    Leverages Google's permissive free-tier, eliminating quota issues.
-    """
+class QwenPlanner:
+    """Dynamic layout workspace analyzer driven entirely by Qwen2.5-VL."""
     
     def __init__(self, api_key: Optional[str] = None):
-        """
-        Initialize Gemini planner.
-        
-        Args:
-            api_key: Gemini API key. If None, uses GEMINI_API_KEY env var.
-        """
-        if not GEMINI_AVAILABLE:
-            raise ImportError("google-genai not installed. Run: pip install google-genai")
-        
-        # The genai.Client will naturally look for the GEMINI_API_KEY env variable,
-        # but we pass it explicitly here if custom initialized.
-        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
-        if not self.api_key:
-            raise ValueError("GEMINI_API_KEY not found in environment or parameters.")
-        
-        self.client = genai.Client(api_key=self.api_key)
-    
+        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
+        if OPENAI_AVAILABLE and self.api_key:
+            self.client = openai.OpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=self.api_key
+            )
+        else:
+            self.client = None
+
     def plan_icon_location(self, screenshot: Image.Image, target_app: str) -> Dict:
-        """
-        Use Gemini 2.5 Flash API to predict likely regions where target app icon is located.
+        if not self.client:
+            raise ValueError("OpenRouter client is uninitialized or API key is missing.")
+            
+        width, height = screenshot.size
         
-        Args:
-            screenshot: PIL Image of desktop (1920x1080)
-            target_app: Name of application to find (e.g., "Notepad", "Word")
-        
-        Returns:
-            Dict with keys:
-                - reasoning: LLM's explanation of predictions
-                - likely_regions: List of [x1, y1, x2, y2] candidate regions
-                - predicted_center: [x, y] of most likely center
-                - confidence: Model's confidence (0.0-1.0)
-        """
-        
-        prompt = f"""You are a desktop UI expert analyzing a Windows desktop screenshot (1920x1080 resolution).
+        prompt = f"""You are an expert operating system workspace analysis model.
+The exact image dimensions provided are {width}x{height} pixels.
 
-Task: Predict where the '{target_app}' application icon is located on this desktop.
+Task: Predict 3 to 5 bounding boxes [x1, y1, x2, y2] where the '{target_app}' application icon is likely located on this canvas.
 
-Requirements:
-1. Desktop icons typically appear in corners, edges, or center areas
-2. Analyze the visible desktop layout
-3. Consider common Windows conventions (top-left, top-right, bottom areas, center)
-4. Return ONLY valid JSON conforming to the requested schema. Do not add markdown or backticks.
+Constraints:
+1. Every coordinate bound must map within the image boundaries: X [0 to {width}], Y [0 to {height}].
+2. Prioritize standard UI placement zones if the image represents a standard desktop space.
+3. Return ONLY a valid JSON object matching the requested schema. No markdown wrapping.
 
-Respond with ONLY this JSON structure:
+Required JSON Structure:
 {{
-    "reasoning": "Brief explanation of why these regions are likely",
+    "reasoning": "Brief analysis details of icon location signatures inside this {width}x{height} patch.",
     "likely_regions": [
         [x1, y1, x2, y2],
         [x1, y1, x2, y2],
         [x1, y1, x2, y2]
     ],
     "predicted_center": [x, y],
-    "confidence": 0.75
-}}
+    "confidence": 0.85
+}}"""
 
-Notes:
-- Coordinates are in pixels (1920x1080 canvas)
-- Each region is [x1, y1, x2, y2] (top-left to bottom-right)
-- Provide 3-5 candidate regions ranked by likelihood
-- predicted_center is your single best guess
-- confidence is 0.0-1.0 (how sure you are)"""
+        buffered = BytesIO()
+        screenshot.save(buffered, format="PNG")
+        img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+
+        response = self.client.chat.completions.create(
+            model="qwen/qwen-2.5-vl-72b-instruct",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_base64}"}}
+                    ]
+                }
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.1,
+            max_tokens=1000
+        )
         
-        try:
-            # We can pass the PIL Image directly inside the content parts list.
-            response = self.client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=[screenshot, prompt],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.1,  # Lower temperature helps structure coordinates reliably
-                )
-            )
-            
-            response_text = response.text.strip()
-            
-            # Clean up potential markdown wrapping
-            if response_text.startswith("```"):
-                response_text = response_text.split("```")[1]
-                if response_text.startswith("json"):
-                    response_text = response_text[4:]
-                response_text = response_text.strip()
-                if response_text.endswith("```"):
-                    response_text = response_text[:-3].strip()
-            
-            result = json.loads(response_text)
-            
-            # Validate output structure
-            required_keys = ["reasoning", "likely_regions", "predicted_center", "confidence"]
-            if not all(k in result for k in required_keys):
-                raise ValueError(f"Missing required keys. Got: {list(result.keys())}")
-            
-            # Validate and clamp regions
-            for i, region in enumerate(result["likely_regions"]):
-                if len(region) != 4:
-                    raise ValueError(f"Invalid region format: {region}")
-                x1, y1, x2, y2 = region
+        text = response.choices[0].message.content.strip()
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
                 
-                # Clamp to valid bounds
-                x1 = max(0, min(x1, 1920))
-                x2 = max(x1 + 1, min(x2, 1920))
-                y1 = max(0, min(y1, 1080))
-                y2 = max(y1 + 1, min(y2, 1080))
-                result["likely_regions"][i] = [x1, y1, x2, y2]
-            
-            print(f"✓ Planning phase complete for '{target_app}' (Gemini)")
-            print(f"  Reasoning: {result['reasoning'][:80]}...")
-            print(f"  Confidence: {result['confidence']:.0%}")
-            print(f"  Regions: {len(result['likely_regions'])} candidates")
-            print(f"  Best guess: {result['predicted_center']}")
-            
-            return result
+        data = json.loads(text)
         
-        except json.JSONDecodeError as e:
-            print(f"✗ Failed to parse Gemini response as JSON: {e}")
-            print(f"Response: {response_text[:300]}")
-            raise
-        except Exception as e:
-            print(f"✗ Gemini API error: {e}")
-            raise
-
+        # Enforce boundary checking filters
+        cleaned_regions = []
+        for region in data.get("likely_regions", []):
+            rx1 = max(0, min(int(region[0]), width))
+            ry1 = max(0, min(int(region[1]), height))
+            rx2 = max(rx1 + 5, min(int(region[2]), width))
+            ry2 = max(ry1 + 5, min(int(region[3]), height))
+            cleaned_regions.append([rx1, ry1, rx2, ry2])
+            
+        data["likely_regions"] = cleaned_regions
+        return data
 
 class HeuristicPlanner:
     """
