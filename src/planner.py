@@ -1,58 +1,49 @@
 """
-Planning Phase: Use DeepSeek-V3 to predict likely regions where target app icon is located.
+Planning Phase: Use Claude API (vision) to predict likely regions where target app icon is located.
 Inspired by ScreenSeekeR's position inference.
 
-Uses Hugging Face Inference API for DeepSeek-V3-0324.
-No quota limits, available models, generous free tier.
+Returns structured JSON with candidate regions, reasoning, and confidence.
 """
 
 import json
 import os
-import time
 import base64
-import requests
 from io import BytesIO
 from PIL import Image
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+    print("⚠ Warning: anthropic not installed. Install with: uv pip install anthropic")
 
-class DeepSeekPlanner:
+
+class ClaudePlanner:
     """
-    Planning phase using DeepSeek-V3 via Hugging Face Inference API.
-    Highly capable model for visual reasoning about desktop layouts.
+    Planning phase using Claude API (vision) for visual desktop analysis.
+    More reliable than Gemini, no quota issues.
     """
     
-    def __init__(self, hf_token: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None):
         """
-        Initialize DeepSeek planner.
+        Initialize Claude planner.
         
         Args:
-            hf_token: Hugging Face API token. If None, uses HF_TOKEN env var.
+            api_key: Anthropic API key. If None, uses ANTHROPIC_API_KEY env var.
         """
-        self.hf_token = hf_token or os.getenv("HF_TOKEN")
-        if not self.hf_token:
-            raise ValueError("HF_TOKEN not found in environment or parameters. "
-                           "Get one from https://huggingface.co/settings/tokens")
+        if not ANTHROPIC_AVAILABLE:
+            raise ImportError("anthropic not installed. Run: uv pip install anthropic")
         
-        self.api_url = "https://router.huggingface.co/v1/chat/completions"
-        self.headers = {
-            "Authorization": f"Bearer {self.hf_token}",
-            "Content-Type": "application/json"
-        }
-        self.model = "deepseek-ai/DeepSeek-V3-0324"
-        self.last_request_time = 0
-        self.min_request_interval = 1.0  # Prevent rate limiting
-    
-    def _rate_limit(self):
-        """Enforce minimum time between API requests."""
-        elapsed = time.time() - self.last_request_time
-        if elapsed < self.min_request_interval:
-            time.sleep(self.min_request_interval - elapsed)
-        self.last_request_time = time.time()
+        self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
+        if not self.api_key:
+            raise ValueError("ANTHROPIC_API_KEY not found in environment or parameters.")
+        
+        self.client = anthropic.Anthropic(api_key=self.api_key)
     
     def _image_to_base64(self, image: Image.Image) -> str:
         """Convert PIL Image to base64 string."""
@@ -62,7 +53,7 @@ class DeepSeekPlanner:
     
     def plan_icon_location(self, screenshot: Image.Image, target_app: str) -> Dict:
         """
-        Use Qwen2.5-VL to predict likely regions where target app icon is located.
+        Use Claude API to predict likely regions where target app icon is located.
         
         Args:
             screenshot: PIL Image of desktop (1920x1080)
@@ -76,13 +67,9 @@ class DeepSeekPlanner:
                 - confidence: Model's confidence (0.0-1.0)
         """
         
-        self._rate_limit()
+        # Convert image to base64
+        base64_image = self._image_to_base64(screenshot)
         
-        # Convert image to base64 data URL
-        image_base64 = self._image_to_base64(screenshot)
-        image_data_url = f"data:image/png;base64,{image_base64}"
-        
-        # Craft the prompt
         prompt = f"""You are a desktop UI expert analyzing a Windows desktop screenshot (1920x1080 resolution).
 
 Task: Predict where the '{target_app}' application icon is located on this desktop.
@@ -114,45 +101,32 @@ Notes:
 - Return ONLY the JSON object, nothing else"""
         
         try:
-            # Call Qwen via HF Inference API
-            payload = {
-                "model": self.model,
-                "messages": [
+            response = self.client.messages.create(
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=1024,
+                messages=[
                     {
                         "role": "user",
                         "content": [
                             {
-                                "type": "text",
-                                "text": prompt
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": base64_image
+                                }
                             },
                             {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": image_data_url
-                                }
+                                "type": "text",
+                                "text": prompt
                             }
                         ]
                     }
                 ]
-            }
-            
-            response = requests.post(
-                self.api_url,
-                headers=self.headers,
-                json=payload,
-                timeout=60
             )
             
-            if response.status_code != 200:
-                error_msg = response.text
-                raise RuntimeError(f"HF API error {response.status_code}: {error_msg}")
-            
-            result_data = response.json()
-            
-            if "choices" not in result_data or not result_data["choices"]:
-                raise ValueError(f"Invalid API response: {result_data}")
-            
-            response_text = result_data["choices"][0]["message"]["content"].strip()
+            # Parse response
+            response_text = response.content[0].text.strip()
             
             # Remove markdown code blocks if present
             if response_text.startswith("```"):
@@ -168,21 +142,20 @@ Notes:
             if not all(k in result for k in required_keys):
                 raise ValueError(f"Missing required keys. Got: {list(result.keys())}")
             
-            # Validate regions
+            # Validate and clamp regions
             for i, region in enumerate(result["likely_regions"]):
                 if len(region) != 4:
                     raise ValueError(f"Invalid region format: {region}")
                 x1, y1, x2, y2 = region
                 
                 # Clamp to valid bounds
-                if not (0 <= x1 < x2 <= 1920 and 0 <= y1 < y2 <= 1080):
-                    x1 = max(0, min(x1, 1920))
-                    x2 = max(x1 + 1, min(x2, 1920))
-                    y1 = max(0, min(y1, 1080))
-                    y2 = max(y1 + 1, min(y2, 1080))
-                    result["likely_regions"][i] = [x1, y1, x2, y2]
+                x1 = max(0, min(x1, 1920))
+                x2 = max(x1 + 1, min(x2, 1920))
+                y1 = max(0, min(y1, 1080))
+                y2 = max(y1 + 1, min(y2, 1080))
+                result["likely_regions"][i] = [x1, y1, x2, y2]
             
-            print(f"✓ Planning phase complete for '{target_app}' (DeepSeek-V3)")
+            print(f"✓ Planning phase complete for '{target_app}' (Claude)")
             print(f"  Reasoning: {result['reasoning'][:80]}...")
             print(f"  Confidence: {result['confidence']:.0%}")
             print(f"  Regions: {len(result['likely_regions'])} candidates")
@@ -191,21 +164,18 @@ Notes:
             return result
         
         except json.JSONDecodeError as e:
-            print(f"✗ Failed to parse Qwen response as JSON: {e}")
+            print(f"✗ Failed to parse Claude response as JSON: {e}")
             print(f"Response: {response_text[:300]}")
             raise
-        except requests.exceptions.Timeout:
-            print("✗ Qwen API request timed out (>60s)")
-            raise
         except Exception as e:
-            print(f"✗ Qwen API error: {e}")
+            print(f"✗ Claude API error: {e}")
             raise
 
 
 class HeuristicPlanner:
     """
     Fallback heuristic planner (no API needed).
-    Use when Qwen is unavailable or for comparison.
+    Use when Claude is unavailable or for comparison.
     """
     
     @staticmethod
@@ -238,14 +208,13 @@ class HeuristicPlanner:
             "reasoning": f"Using heuristic desktop layout knowledge for '{target_app}'",
             "likely_regions": [[x1, y1, x2, y2] for x1, y1, x2, y2 in regions],
             "predicted_center": [width // 2, height // 2],
-            "confidence": 0.5,  # Lower confidence than Qwen
+            "confidence": 0.5,  # Lower confidence than Claude
             "method": "heuristic"
         }
         
         print(f"✓ Heuristic planning complete for '{target_app}'")
         print(f"  Regions: {len(result['likely_regions'])} candidates")
         print(f"  Confidence: {result['confidence']:.0%}")
-        print(f"  Note: Using fallback (no vision-based analysis)")
         
         return result
 
@@ -258,7 +227,7 @@ if __name__ == "__main__":
     from screenshot import take_screenshot
     
     print("=" * 70)
-    print("PLANNING PHASE TEST - DeepSeek-V3 via Hugging Face Inference API")
+    print("PLANNER TEST - Claude API")
     print("=" * 70)
     
     # Capture a screenshot
@@ -270,32 +239,32 @@ if __name__ == "__main__":
         print(f"      Error capturing screenshot: {e}")
         exit(1)
     
-    # Test DeepSeek planner
-    print("\n[2/2] Testing DeepSeek-V3 Planner...")
+    # Test Claude planner
+    print("\n[2/2] Testing Claude Planner...")
     try:
-        planner = DeepSeekPlanner()
+        planner = ClaudePlanner()
         result = planner.plan_icon_location(img, target_app="Notepad")
         
-        print("\n      DeepSeek Result:")
-        print(f"      Reasoning: {result['reasoning']}")
-        print(f"      Predicted Center: {result['predicted_center']}")
-        print(f"      Confidence: {result['confidence']:.0%}")
-        print(f"      Likely Regions:")
+        print("\n✓ Claude Planner Result:")
+        print(f"  Reasoning: {result['reasoning']}")
+        print(f"  Predicted Center: {result['predicted_center']}")
+        print(f"  Confidence: {result['confidence']:.0%}")
+        print(f"  Likely Regions:")
         for i, region in enumerate(result['likely_regions'], 1):
-            print(f"        {i}. {region}")
+            print(f"    {i}. {region}")
         
-        print("\n✓ Planning phase test complete!")
+        # Validate output
+        assert isinstance(result['confidence'], (int, float)), "Confidence must be numeric"
+        assert 0 <= result['confidence'] <= 1, "Confidence must be 0-1"
+        assert len(result['likely_regions']) > 0, "Must have at least one region"
+        
+        print("\n✓ Planner test passed!")
     except Exception as e:
-        print(f"      ✗ DeepSeek Planner failed: {e}")
-        print("\n      Falling back to Heuristic Planner...")
+        print(f"\n✗ Claude Planner failed: {e}")
+        print("  Falling back to Heuristic...")
         
-        heuristic_planner = HeuristicPlanner()
-        heuristic_result = heuristic_planner.plan_icon_location(img, target_app="Notepad")
-        
-        print("\n      Heuristic Result:")
-        print(f"      Reasoning: {heuristic_result['reasoning']}")
-        print(f"      Predicted Center: {heuristic_result['predicted_center']}")
-        print(f"      Confidence: {heuristic_result['confidence']:.0%}")
-        print(f"\n✓ Heuristic planning test complete!")
+        heuristic = HeuristicPlanner()
+        result = heuristic.plan_icon_location(img, target_app="Notepad")
+        print(f"\n✓ Heuristic fallback result: {result['predicted_center']}")
     
     print("=" * 70)

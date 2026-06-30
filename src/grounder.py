@@ -1,54 +1,65 @@
 """
-Grounding Phase: Use HF-hosted CLIP to precisely locate target app icon within predicted regions.
-No local PyTorch needed - runs entirely via HF Inference API.
-Inspired by ScreenSeekeR's visual grounding stage.
+Grounding Phase: Use Claude API (vision) to precisely locate target app icon within predicted regions.
+Inspired by ScreenSeekeR's visual grounding stage with voting mechanism.
+
+Returns multiple bounding box predictions (voting boxes) for scoring.
 """
 
 import os
+import json
 import base64
-import requests
 from io import BytesIO
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 from PIL import Image
 from dotenv import load_dotenv
 
 load_dotenv()
 
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+    print("⚠ Warning: anthropic not installed. Install with: uv pip install anthropic")
 
-class HFCLIPGrounder:
+
+class ClaudeGrounder:
     """
-    Grounding phase using CLIP via Hugging Face Inference API.
-    No local dependencies - pure API-based.
+    Grounding phase using Claude API (vision) to locate target within regions.
+    Returns multiple voting boxes for confidence scoring.
     """
     
-    def __init__(self, hf_token: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None):
         """
-        Initialize HF CLIP grounder.
+        Initialize Claude grounder.
         
         Args:
-            hf_token: Hugging Face API token. If None, uses HF_TOKEN env var.
+            api_key: Anthropic API key. If None, uses ANTHROPIC_API_KEY env var.
         """
-        self.hf_token = hf_token or os.getenv("HF_TOKEN")
-        if not self.hf_token:
-            raise ValueError("HF_TOKEN not found. Get one from https://huggingface.co/settings/tokens")
+        if not ANTHROPIC_AVAILABLE:
+            raise ImportError("anthropic not installed. Run: uv pip install anthropic")
         
-        self.headers = {"Authorization": f"Bearer {self.hf_token}"}
-        self.clip_api_url = "https://api-inference.huggingface.co/models/openai/clip-vit-base-patch32"
+        self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
+        if not self.api_key:
+            raise ValueError("ANTHROPIC_API_KEY not found. Get one from Anthropic console.")
+        
+        self.client = anthropic.Anthropic(api_key=self.api_key)
     
-    def _image_to_base64(self, image: Image.Image) -> bytes:
-        """Convert PIL Image to bytes."""
+    def _image_to_base64(self, image: Image.Image) -> str:
+        """Convert PIL Image to base64 string."""
         buffer = BytesIO()
         image.save(buffer, format="PNG")
-        return buffer.getvalue()
+        return base64.standard_b64encode(buffer.getvalue()).decode("utf-8")
     
     def ground_icon_in_regions(
         self,
         screenshot: Image.Image,
         candidate_regions: List[List[int]],
         target_app: str
-    ) -> Optional[Tuple[int, int, float]]:
+    ) -> Optional[Dict]:
         """
-        Use HF-hosted CLIP to locate icon within candidate regions.
+        Use Claude API to locate icon within candidate regions.
+        Returns voting boxes (multiple predictions) for scoring.
         
         Args:
             screenshot: Full desktop screenshot (PIL Image)
@@ -56,99 +67,114 @@ class HFCLIPGrounder:
             target_app: Name of application (e.g., "Notepad", "Word")
         
         Returns:
-            Tuple of (center_x, center_y, confidence) or None if not found
+            Dict with:
+                - center: (x, y) best prediction
+                - confidence: 0.0-1.0
+                - voting_boxes: List of candidate boxes for scoring
         """
         
-        best_match = None
-        best_score = 0.0
+        base64_image = self._image_to_base64(screenshot)
         
-        print(f"\n🔍 Grounding phase (HF CLIP): Searching {len(candidate_regions)} regions for '{target_app}'")
+        # Build region descriptions
+        region_descriptions = "\n".join([
+            f"Region {i}: [{x1}, {y1}, {x2}, {y2}]"
+            for i, (x1, y1, x2, y2) in enumerate(candidate_regions)
+        ])
         
-        # Text candidates to search for
-        text_descriptions = [
-            f"{target_app} application icon",
-            f"{target_app} app shortcut",
-            f"{target_app} desktop icon",
-        ]
+        prompt = f"""You are a visual grounding expert. Your task is to locate the exact position of a '{target_app}' icon on this desktop screenshot (1920x1080).
+
+Here are candidate regions where it might be located:
+{region_descriptions}
+
+Task: For each candidate region, predict the bounding box of the '{target_app}' icon if it exists there.
+
+Return ONLY this JSON (no markdown or code blocks):
+{{
+    "reasoning": "Why you think the icon is in these locations",
+    "voting_boxes": [
+        {{"box": [x1, y1, x2, y2], "confidence": 0.95, "region": 0}},
+        {{"box": [x1, y1, x2, y2], "confidence": 0.92, "region": 0}},
+        {{"box": [x1, y1, x2, y2], "confidence": 0.85, "region": 1}}
+    ],
+    "best_center": [x, y],
+    "overall_confidence": 0.85
+}}
+
+Notes:
+- voting_boxes: List of 5-10 predicted bounding boxes (votes)
+- Each box is [x1, y1, x2, y2] in pixel coordinates
+- confidence: How certain you are about this specific box (0.0-1.0)
+- region: Which candidate region this box is from
+- best_center: The [x, y] center of your single best prediction
+- overall_confidence: Overall confidence in finding the target (0.0-1.0)
+- Return ONLY JSON, nothing else"""
         
-        # Test each candidate region
-        for i, region in enumerate(candidate_regions, 1):
-            x1, y1, x2, y2 = region
-            cropped = screenshot.crop((x1, y1, x2, y2))
-            crop_width = x2 - x1
-            crop_height = y2 - y1
-            
-            print(f"  [{i}/{len(candidate_regions)}] Region {region}...", end=" ", flush=True)
-            
-            try:
-                # Convert image to bytes
-                image_bytes = self._image_to_base64(cropped)
-                
-                # Query HF CLIP API for each text description
-                max_similarity = 0.0
-                
-                for text_desc in text_descriptions:
-                    response = requests.post(
-                        self.clip_api_url,
-                        headers=self.headers,
-                        json={
-                            "inputs": {
-                                "text": text_desc,
-                                "image": base64.b64encode(image_bytes).decode()
+        try:
+            response = self.client.messages.create(
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=1024,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": base64_image
+                                }
+                            },
+                            {
+                                "type": "text",
+                                "text": prompt
                             }
-                        },
-                        timeout=30
-                    )
-                    
-                    if response.status_code != 200:
-                        raise RuntimeError(f"HF API error {response.status_code}: {response.text[:200]}")
-                    
-                    result = response.json()
-                    
-                    # HF CLIP returns logits_per_image
-                    if isinstance(result, list) and len(result) > 0:
-                        similarity = float(result[0])
-                        max_similarity = max(max_similarity, similarity)
-                
-                # Convert logits to approximate confidence (0-1)
-                confidence = min(1.0, max(0.0, (max_similarity + 5) / 10))  # Rough scaling
-                
-                print(f"✓ {confidence:.0%}")
-                
-                if confidence > best_score:
-                    best_score = confidence
-                    center_x = x1 + (crop_width // 2)
-                    center_y = y1 + (crop_height // 2)
-                    best_match = (center_x, center_y, confidence)
+                        ]
+                    }
+                ]
+            )
             
-            except Exception as e:
-                print(f"✗ {str(e)[:40]}")
-                continue
+            # Parse response
+            response_text = response.content[0].text.strip()
+            
+            # Remove markdown
+            if response_text.startswith("```"):
+                response_text = response_text.split("```")[1]
+                if response_text.startswith("json"):
+                    response_text = response_text[4:]
+                response_text = response_text.strip()
+            
+            result = json.loads(response_text)
+            
+            # Validate
+            required_keys = ["reasoning", "voting_boxes", "best_center", "overall_confidence"]
+            if not all(k in result for k in required_keys):
+                raise ValueError(f"Missing required keys. Got: {list(result.keys())}")
+            
+            # Clamp coordinates
+            for box_data in result["voting_boxes"]:
+                x1, y1, x2, y2 = box_data["box"]
+                x1 = max(0, min(x1, 1920))
+                x2 = max(x1 + 1, min(x2, 1920))
+                y1 = max(0, min(y1, 1080))
+                y2 = max(y1 + 1, min(y2, 1080))
+                box_data["box"] = [x1, y1, x2, y2]
+            
+            print(f"✓ Grounding phase complete for '{target_app}' (Claude)")
+            print(f"  Reasoning: {result['reasoning'][:80]}...")
+            print(f"  Overall confidence: {result['overall_confidence']:.0%}")
+            print(f"  Voting boxes: {len(result['voting_boxes'])} predictions")
+            print(f"  Best center: {result['best_center']}")
+            
+            return result
         
-        # Report results
-        if best_match and best_score > 0.3:  # Confidence threshold
-            x, y, conf = best_match
-            print(f"\n✓ Grounding complete! Found '{target_app}' at ({x}, {y}) with {conf:.0%} confidence")
-            return best_match
-        else:
-            print(f"\n⚠ CLIP confidence too low ({best_score:.0%}), using heuristic fallback...")
-            return self._heuristic_fallback(candidate_regions)
-    
-    @staticmethod
-    def _heuristic_fallback(candidate_regions: List[List[int]]) -> Optional[Tuple[int, int, float]]:
-        """
-        Fallback: Return center of first (best-predicted) region.
-        """
-        if not candidate_regions:
-            return None
-        
-        x1, y1, x2, y2 = candidate_regions[0]
-        center_x = (x1 + x2) // 2
-        center_y = (y1 + y2) // 2
-        
-        print(f"  Returning center of best-predicted region: ({center_x}, {center_y})")
-        
-        return (center_x, center_y, 0.5)
+        except json.JSONDecodeError as e:
+            print(f"✗ Failed to parse Claude response as JSON: {e}")
+            print(f"Response: {response_text[:300]}")
+            raise
+        except Exception as e:
+            print(f"✗ Claude grounder error: {e}")
+            raise
 
 
 class SimpleHeuristicGrounder:
@@ -162,19 +188,8 @@ class SimpleHeuristicGrounder:
         screenshot: Image.Image,
         candidate_regions: List[List[int]],
         target_app: str
-    ) -> Optional[Tuple[int, int, float]]:
-        """
-        Return center of first region (planning confidence).
-        
-        Args:
-            screenshot: Full screenshot (not used)
-            candidate_regions: List of regions
-            target_app: Application name
-        
-        Returns:
-            Center of first region
-        """
-        
+    ) -> Optional[Dict]:
+        """Return center of first region."""
         if not candidate_regions:
             return None
         
@@ -184,9 +199,18 @@ class SimpleHeuristicGrounder:
         center_x = (x1 + x2) // 2
         center_y = (y1 + y2) // 2
         
-        print(f"  Result: ({center_x}, {center_y}) with 50% confidence (best region center)")
+        result = {
+            "reasoning": "Heuristic fallback: using center of best-predicted region",
+            "voting_boxes": [
+                {"box": [x1, y1, x2, y2], "confidence": 0.5, "region": 0}
+            ],
+            "best_center": [center_x, center_y],
+            "overall_confidence": 0.5
+        }
         
-        return (center_x, center_y, 0.5)
+        print(f"  Result: ({center_x}, {center_y}) with 50% confidence")
+        
+        return result
 
 
 # ============================================================================
@@ -195,10 +219,10 @@ class SimpleHeuristicGrounder:
 
 if __name__ == "__main__":
     from screenshot import take_screenshot
-    from planner import DeepSeekPlanner, HeuristicPlanner
+    from planner import ClaudePlanner, HeuristicPlanner
     
     print("=" * 70)
-    print("FULL PIPELINE TEST: Planning (Heuristic) + Grounding (HF CLIP)")
+    print("GROUNDER TEST - Claude API with Voting Mechanism")
     print("=" * 70)
     
     # Step 1: Capture screenshot
@@ -213,11 +237,12 @@ if __name__ == "__main__":
     # Step 2: Planning phase
     print("\n[2/3] Planning phase...")
     try:
-        planner = DeepSeekPlanner()
+        planner = ClaudePlanner()
         plan = planner.plan_icon_location(screenshot, target_app="Notepad")
         regions = plan["likely_regions"]
+        print(f"      Got {len(regions)} candidate regions")
     except Exception as e:
-        print(f"      DeepSeek failed: {e}")
+        print(f"      Claude planner failed: {e}")
         print("      Using heuristic planning...")
         planner = HeuristicPlanner()
         plan = planner.plan_icon_location(screenshot, target_app="Notepad")
@@ -226,25 +251,34 @@ if __name__ == "__main__":
     # Step 3: Grounding phase
     print("\n[3/3] Grounding phase...")
     try:
-        grounder = HFCLIPGrounder()
+        grounder = ClaudeGrounder()
         result = grounder.ground_icon_in_regions(screenshot, regions, target_app="Notepad")
         
         if result:
-            x, y, confidence = result
-            print(f"\n✅ SUCCESS! Found Notepad at ({x}, {y}) with {confidence:.0%} confidence")
-            print(f"   Ready to click and automate!")
+            print(f"\n✓ Grounding Result:")
+            print(f"  Reasoning: {result['reasoning']}")
+            print(f"  Best Center: {result['best_center']}")
+            print(f"  Overall Confidence: {result['overall_confidence']:.0%}")
+            print(f"  Voting Boxes: {len(result['voting_boxes'])}")
+            
+            # Validate
+            assert len(result['voting_boxes']) > 0, "Must have voting boxes"
+            assert 0 <= result['overall_confidence'] <= 1, "Confidence must be 0-1"
+            assert len(result['best_center']) == 2, "Center must be [x, y]"
+            
+            print(f"\n✅ Grounder test passed!")
         else:
             print("\n⚠ Grounding returned None")
     
     except Exception as e:
-        print(f"\n❌ Grounding error: {e}")
-        print("   Trying heuristic-only grounder...")
+        print(f"\n❌ Grounder error: {e}")
+        print("Trying heuristic-only grounder...")
         try:
             grounder = SimpleHeuristicGrounder()
             result = grounder.ground_icon_in_regions(screenshot, regions, target_app="Notepad")
             if result:
-                x, y, conf = result
-                print(f"\n✅ Heuristic grounder: ({x}, {y}) with {conf:.0%} confidence")
+                x, y = result['best_center']
+                print(f"\n✓ Heuristic grounder: ({x}, {y}) with {result['overall_confidence']:.0%} confidence")
         except Exception as e2:
             print(f"✗ All grounding methods failed: {e2}")
     
