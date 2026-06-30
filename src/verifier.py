@@ -16,39 +16,34 @@ from dotenv import load_dotenv
 load_dotenv()
 
 try:
-    import anthropic
-    ANTHROPIC_AVAILABLE = True
+    from google import genai
+    from google.genai import types
+    GEMINI_AVAILABLE = True
 except ImportError:
-    ANTHROPIC_AVAILABLE = False
-    print("⚠ Warning: anthropic not installed.")
+    GEMINI_AVAILABLE = False
+    print("⚠ Warning: google-genai not installed.")
 
 
-class ClaudeVerifier:
+class GeminiVerifier:
     """
-    Verification phase using Claude API to verify if detected element matches instruction.
+    Verification phase using Gemini API to verify if detected element matches instruction.
     """
     
     def __init__(self, api_key: Optional[str] = None):
         """
-        Initialize Claude verifier.
+        Initialize Gemini verifier.
         
         Args:
-            api_key: Anthropic API key. If None, uses ANTHROPIC_API_KEY env var.
+            api_key: Google Gemini API key. If None, uses GEMINI_API_KEY env var.
         """
-        if not ANTHROPIC_AVAILABLE:
-            raise ImportError("anthropic not installed. Run: uv pip install anthropic")
+        if not GEMINI_AVAILABLE:
+            raise ImportError("google-genai not installed. Run: pip install google-genai")
         
-        self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         if not self.api_key:
-            raise ValueError("ANTHROPIC_API_KEY not found.")
+            raise ValueError("GEMINI_API_KEY not found.")
         
-        self.client = anthropic.Anthropic(api_key=self.api_key)
-    
-    def _image_to_base64(self, image: Image.Image) -> str:
-        """Convert PIL Image to base64 string."""
-        buffer = BytesIO()
-        image.save(buffer, format="PNG")
-        return base64.standard_b64encode(buffer.getvalue()).decode("utf-8")
+        self.client = genai.Client(api_key=self.api_key)
     
     def verify_target(
         self,
@@ -68,15 +63,15 @@ class ClaudeVerifier:
             - refined_instruction: Clearer version of instruction if target not found
         """
         
-        base64_image = self._image_to_base64(cropped_screenshot)
-        
         prompt = f"""You are a visual verification expert.
 
 Instruction: {instruction}
 
 Look at this cropped screenshot. Your task is to determine if it contains the target described in the instruction.
 
-Analyze the screenshot and respond with ONLY this JSON (no code blocks or markdown):
+Analyze the screenshot and respond with ONLY this JSON. Do not output markdown code blocks.
+
+Schema:
 {{
     "result": "is_target" | "target_elsewhere" | "target_not_found",
     "reasoning": "Brief explanation of your analysis",
@@ -86,50 +81,27 @@ Analyze the screenshot and respond with ONLY this JSON (no code blocks or markdo
 result values:
 - "is_target": The cropped region contains the target element
 - "target_elsewhere": The target exists in the full screenshot but not in this crop
-- "target_not_found": The target does not appear to exist
-
-Return ONLY the JSON object, nothing else."""
+- "target_not_found": The target does not appear to exist"""
         
         try:
-            response = self.client.messages.create(
-                model="claude-3-5-sonnet-20241022",
-                max_tokens=512,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": "image/png",
-                                    "data": base64_image
-                                }
-                            },
-                            {
-                                "type": "text",
-                                "text": prompt
-                            }
-                        ]
-                    }
-                ]
+            config = types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.1
             )
             
-            response_text = response.content[0].text.strip()
+            response = self.client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[cropped_screenshot, prompt],
+                config=config
+            )
             
-            # Remove markdown
-            if response_text.startswith("```"):
-                response_text = response_text.split("```")[1]
-                if response_text.startswith("json"):
-                    response_text = response_text[4:]
-                response_text = response_text.strip()
-            
+            response_text = response.text.strip()
             result = json.loads(response_text)
             
-            # Validate
+            # Validate output keys and values
             valid_results = ["is_target", "target_elsewhere", "target_not_found"]
-            if result["result"] not in valid_results:
-                raise ValueError(f"Invalid result: {result['result']}")
+            if "result" not in result or result["result"] not in valid_results:
+                raise ValueError(f"Invalid result: {result.get('result')}")
             
             is_target = (result["result"] == "is_target")
             new_instruction = result.get("new_instruction") or instruction
@@ -160,18 +132,11 @@ class SimpleVerifier:
     ) -> Tuple[bool, str]:
         """
         Simple verification: assume positive if image is not empty.
-        
-        Args:
-            cropped_screenshot: PIL Image of the detected region
-            instruction: Target description
-        
-        Returns:
-            Tuple of (is_target, instruction)
         """
         # Simple heuristic: if image has any non-uniform pixels, assume target exists
-        pixels = list(cropped_screenshot.get_flattened_data())
-        
-        if len(set(pixels)) > 1:  # More than one unique color
+        # In Python PIL, we can get standard extrema to see if there is color variation
+        extrema = cropped_screenshot.convert("L").getextrema()
+        if extrema and extrema[0] != extrema[1]:  # Min != Max pixel intensity
             return True, instruction
         else:
             return False, instruction
@@ -198,11 +163,11 @@ if __name__ == "__main__":
         exit(1)
     
     # Create a test crop (assume we found something in top-left)
-    print("\n[2/2] Testing Claude Verifier...")
-    crop = screenshot.crop((0, 0, 100, 100))
+    print("\n[2/2] Testing Gemini Verifier...")
+    crop = screenshot.crop((20, 240, 90, 320))
     
     try:
-        verifier = ClaudeVerifier()
+        verifier = GeminiVerifier()
         is_target, new_instr = verifier.verify_target(crop, "Notepad application icon")
         
         print(f"\n✓ Verification Result:")
@@ -213,7 +178,7 @@ if __name__ == "__main__":
         print(f"\n✅ Verifier test passed!")
     
     except Exception as e:
-        print(f"\n❌ Claude verifier failed: {e}")
+        print(f"\n❌ Gemini verifier failed: {e}")
         print("  Trying heuristic verifier...")
         
         verifier = SimpleVerifier()

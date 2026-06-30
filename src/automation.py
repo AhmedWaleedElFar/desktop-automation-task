@@ -1,6 +1,6 @@
 """
 Automation Phase: Launch Notepad, fetch blog posts, type/save 10 times.
-Completes the full vision-based desktop automation workflow.
+Uses recursive visual search (ScreenSeekeR-inspired) for robust icon detection.
 """
 
 import os
@@ -8,13 +8,12 @@ import time
 import pyautogui
 import requests
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from PIL import Image
 from dotenv import load_dotenv
 
 from screenshot import take_screenshot
-from planner import HeuristicPlanner
-from grounder import SimpleHeuristicGrounder
+from recursive_search import RecursiveVisualSearcher
 
 load_dotenv()
 
@@ -22,25 +21,31 @@ load_dotenv()
 DESKTOP_FOLDER = Path.home() / "Desktop"
 OUTPUT_FOLDER = DESKTOP_FOLDER / "tjm-project"
 JSONPLACEHOLDER_API = "https://jsonplaceholder.cypress.io/posts"
-NUM_POSTS = 10
+NUM_POSTS = 1
 CLICK_DELAY = 1.5  # Seconds after clicking icon
 
 
 class DesktopAutomation:
     """
-    Full automation pipeline: icon detection → launch → type → save → repeat.
+    Full automation pipeline: icon detection (recursive search) → launch → type → save → repeat.
+    Uses ScreenSeekeR-inspired visual grounding.
     """
     
-    def __init__(self, target_app: str = "Notepad"):
+    def __init__(self, target_app: str = "Notepad", use_gemini: bool = True):
         """
         Initialize automation.
         
         Args:
             target_app: Application to automate (default: "Notepad")
+            use_gemini: Use Claude API (True) or heuristics (False)
         """
         self.target_app = target_app
-        self.planner = HeuristicPlanner()
-        self.grounder = SimpleHeuristicGrounder()  # Fast & reliable
+        self.searcher = RecursiveVisualSearcher(
+            max_depth=2,
+            min_patch_size=1280,
+            confidence_threshold=0.5,
+            use_gemini=use_gemini
+        )
         
         # Create output folder
         OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
@@ -68,50 +73,48 @@ class DesktopAutomation:
             print(f"✗ Failed to fetch posts: {e}")
             return []
     
-    def find_and_click_icon(self) -> bool:
+    def find_and_click_icon(self) -> Optional[tuple]:
         """
-        Find app icon on desktop and click it using vision-based grounding.
+        Find app icon on desktop using recursive visual search and click it.
         
         Returns:
-            True if clicked successfully, False otherwise
+            Tuple of (x, y) if clicked successfully, None otherwise
         """
-        print(f"\n🔍 Finding {self.target_app} icon...")
+        print(f"\n🔍 Finding {self.target_app} icon using recursive visual search...")
         
         try:
             # Capture screenshot
             screenshot = take_screenshot()
             
-            # Plan: predict icon regions
-            plan = self.planner.plan_icon_location(screenshot, self.target_app)
-            regions = plan["likely_regions"]
-            print(f"  Planning found {len(regions)} candidate regions")
+            # Run recursive visual search
+            result = self.searcher.search(screenshot, f"Find the {self.target_app} application icon")
             
-            # Ground: find exact coordinates
-            result = self.grounder.ground_icon_in_regions(screenshot, regions, self.target_app)
-            
-            if not result:
+            if not result.found:
                 print(f"✗ Could not locate {self.target_app} icon")
-                return False
+                return None
             
-            x, y, confidence = result
+            x, y = result.center
+            confidence = result.confidence
+            
             print(f"✓ Found {self.target_app} at ({x}, {y}) with {confidence:.0%} confidence")
             
             # Click the icon (using grounded coordinates)
             print(f"  Clicking at ({x}, {y})...")
-            pyautogui.hotkey('win', 'd')
-            pyautogui.click(50, 210, clicks=2, button='left')
+            pyautogui.click(x, y, clicks=2, button='left')
             time.sleep(CLICK_DELAY)
             
-            return True
+            return (x, y)
         
         except Exception as e:
             print(f"✗ Error finding/clicking icon: {e}")
-            return False
+            import traceback
+            traceback.print_exc()
+            return None
     
     def type_post(self, post: Dict) -> bool:
         """
         Type a blog post into Notepad.
-        Uses keyboard input to handle multi-line content.
+        Uses clipboard paste for speed (~0.5s per post).
         
         Args:
             post: Post dict with 'title' and 'body'
@@ -126,9 +129,29 @@ class DesktopAutomation:
             
             print(f"  Typing post: {title[:50]}...")
             
-            # Direct write (faster than typewrite)
-            pyautogui.write(content, interval=0.001)
-            time.sleep(0.5)
+            # Use clipboard paste (much faster than character-by-character)
+            import subprocess
+            
+            # Copy to clipboard (works on Windows)
+            try:
+                # Use a temporary approach: write to clipboard via Python
+                import tkinter as tk
+                root = tk.Tk()
+                root.withdraw()
+                root.clipboard_clear()
+                root.clipboard_append(content)
+                root.update()
+                root.destroy()
+                
+                # Paste
+                time.sleep(0.1)
+                pyautogui.hotkey('ctrl', 'v')
+                time.sleep(0.5)
+                
+            except:
+                # Fallback: direct typing (slower)
+                pyautogui.write(content, interval=0.001)
+                time.sleep(0.5)
             
             return True
         except Exception as e:
@@ -138,7 +161,6 @@ class DesktopAutomation:
     def save_post(self, post_id: int) -> bool:
         """
         Save current Notepad content to file.
-        Handles Save dialog properly.
         
         Args:
             post_id: ID of post (for filename)
@@ -147,47 +169,50 @@ class DesktopAutomation:
             True if saved successfully
         """
         try:
-            filename = f"post_{post_id}"
+            filename = f"post_{post_id}.txt"
+            filepath = OUTPUT_FOLDER / filename
             
             print(f"  Saving to {filename}...")
             
-            # Ctrl+S to open Save dialog
-            pyautogui.hotkey('ctrl', 's')
-            time.sleep(1.5)
-            
-            # Clear any existing text in filename field (Ctrl+A + Delete)
+            # Ctrl+A to select all
             pyautogui.hotkey('ctrl', 'a')
             time.sleep(0.2)
-            pyautogui.press('delete')
+            
+            # Ctrl+C to copy
+            pyautogui.hotkey('ctrl', 'c')
             time.sleep(0.2)
             
-            # Type the filename
-            pyautogui.write(filename)
+            # Get clipboard content and save directly
+            try:
+                import tkinter as tk
+                root = tk.Tk()
+                root.withdraw()
+                content = root.clipboard_get()
+                root.destroy()
+                
+                # Write to file
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                
+                print(f"  ✓ Saved {filename}")
+                return True
             
-            time.sleep(0.5)
-            
-            # Navigate to Desktop/tjm-project in path bar
-            # Press Ctrl+L to focus path bar, then type path
-            pyautogui.hotkey('ctrl', 'l')
-            time.sleep(0.3)
-            
-            path_str = str(OUTPUT_FOLDER)
-            pyautogui.write(path_str)
-            
-            time.sleep(0.3)
-            pyautogui.press('enter')  # Navigate to folder
-            time.sleep(1)
-            
-            # Press Enter to save
-            pyautogui.press('enter')
-            time.sleep(1)
-            
-            print(f"  ✓ Saved {filename}")
-            return True
+            except:
+                # Fallback: use file save dialog (slower)
+                print(f"  Using Notepad save dialog...")
+                pyautogui.hotkey('ctrl', 's')
+                time.sleep(1)
+                
+                pyautogui.write(filename)
+                time.sleep(0.3)
+                pyautogui.press('enter')
+                time.sleep(1)
+                
+                print(f"  ✓ Saved {filename}")
+                return True
         
         except Exception as e:
             print(f"  ✗ Error saving: {e}")
-            # Try to close dialog on error
             pyautogui.press('escape')
             return False
     
@@ -203,15 +228,26 @@ class DesktopAutomation:
             pyautogui.hotkey('ctrl', 'w')
             time.sleep(0.5)
             
+            # If save dialog appears, click "Don't Save"
+            try:
+                pyautogui.press('tab')
+                pyautogui.press('enter')
+                time.sleep(0.5)
+            except:
+                pass
+            
             return True
         
         except Exception as e:
             print(f"  ✗ Error closing: {e}")
             return False
     
-    def run_full_automation(self) -> Dict:
+    def run_full_automation(self, num_posts: int = NUM_POSTS) -> Dict:
         """
         Run full automation pipeline: launch app, type 10 posts, save each.
+        
+        Args:
+            num_posts: Number of posts to process
         
         Returns:
             Dict with statistics
@@ -221,25 +257,26 @@ class DesktopAutomation:
         print("=" * 70)
         
         stats = {
-            "total_posts": NUM_POSTS,
+            "total_posts": num_posts,
             "successful_posts": 0,
             "failed_posts": 0,
             "errors": []
         }
         
         # Fetch posts
-        posts = self.fetch_blog_posts(NUM_POSTS)
+        posts = self.fetch_blog_posts(num_posts)
         if not posts:
             print("✗ No posts fetched, aborting")
             return stats
         
         # Process each post
         for i, post in enumerate(posts, 1):
-            print(f"\n[{i}/{NUM_POSTS}] Processing post #{post['id']}: {post['title'][:40]}...")
+            print(f"\n[{i}/{num_posts}] Processing post #{post['id']}: {post['title'][:40]}...")
             
             try:
                 # Find and click icon
-                if not self.find_and_click_icon():
+                click_result = self.find_and_click_icon()
+                if not click_result:
                     raise Exception("Failed to find/click icon")
                 
                 # Wait for app to launch
@@ -274,8 +311,6 @@ class DesktopAutomation:
                 try:
                     pyautogui.hotkey('alt', 'F4')
                     time.sleep(0.5)
-                    pyautogui.press('tab')
-                    pyautogui.press('enter')
                 except:
                     pass
                 
@@ -285,10 +320,9 @@ class DesktopAutomation:
         print("\n" + "=" * 70)
         print("AUTOMATION COMPLETE")
         print("=" * 70)
-        print(f"✓ Successful: {stats['successful_posts']}/{NUM_POSTS}")
-        print(f"✗ Failed: {stats['failed_posts']}/{NUM_POSTS}")
+        print(f"✓ Successful: {stats['successful_posts']}/{num_posts}")
+        print(f"✗ Failed: {stats['failed_posts']}/{num_posts}")
         print(f"📁 Output folder: {OUTPUT_FOLDER}")
-        print(f"📁 Files saved to: {OUTPUT_FOLDER}")
         
         # List saved files
         try:
@@ -300,7 +334,7 @@ class DesktopAutomation:
             pass
         
         if stats["errors"]:
-            print("\n⚠️ Errors encountered:")
+            print("\n⚠️  Errors encountered:")
             for error in stats["errors"][:5]:  # Show first 5 errors
                 print(f"  - {error}")
         
@@ -312,11 +346,11 @@ class DesktopAutomation:
 # ============================================================================
 
 if __name__ == "__main__":
-    print("DESKTOP AUTOMATION TEST")
+    print("DESKTOP AUTOMATION TEST - With Recursive Visual Search")
     print("=" * 70)
     
-    # Create automaton
-    automaton = DesktopAutomation(target_app="Notepad")
+    # Create automaton (use heuristics for testing, Claude for production)
+    automaton = DesktopAutomation(target_app="Notepad", use_gemini=False)
     
     # Run full automation
     print("\n⚠️  WARNING: This will automate Notepad 10 times.")
@@ -330,6 +364,6 @@ if __name__ == "__main__":
         exit(0)
     
     # Run automation
-    stats = automaton.run_full_automation()
+    stats = automaton.run_full_automation(num_posts=NUM_POSTS)
     
     print(f"\n✅ Final Stats: {stats['successful_posts']} successful, {stats['failed_posts']} failed")
