@@ -4,14 +4,13 @@ Recursive Visual Search Coordinator Engine entirely mapped over Qwen.
 
 import os
 import traceback
+from datetime import datetime
 from typing import Optional, Tuple, List, Dict
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from dataclasses import dataclass
 
-from planner import QwenPlanner, HeuristicPlanner
-from grounder import OpenRouterGrounder, SimpleHeuristicGrounder
-from verifier import QwenVerifier, SimpleVerifier
-from scoring import get_best_region
+from .scoring import get_best_region, get_best_voting_box_center
+from .visualizer import save_annotated_image, save_detection_screenshot
 
 
 @dataclass
@@ -28,36 +27,30 @@ class RecursiveVisualSearcher:
     
     def __init__(
         self,
+        planner,
+        grounder,
+        verifier,
         max_depth: int = 2,
         min_patch_size: int = 100,
         confidence_threshold: float = 0.5,
-        log_dir: str = "logs"
+        log_dir: str = "logs",
+        run_timestamp: Optional[str] = None
     ):
+        self.planner = planner
+        self.grounder = grounder
+        self.verifier = verifier
         self.max_depth = max_depth
         self.min_patch_size = min_patch_size
         self.confidence_threshold = confidence_threshold
+        # Timestamp prefix shared across all log files in this run
+        self.run_timestamp = run_timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
         
         self.planner_log_dir = os.path.join(log_dir, "planner_regions")
         self.grounder_log_dir = os.path.join(log_dir, "grounder_boxes")
+        self.detections_log_dir = os.path.join(log_dir, "detections")
         os.makedirs(self.planner_log_dir, exist_ok=True)
         os.makedirs(self.grounder_log_dir, exist_ok=True)
-        
-        # Instantiate pure Qwen vision components
-        self.planner = QwenPlanner()
-        self.grounder = OpenRouterGrounder()
-        self.verifier = QwenVerifier()
-            
-        self.heuristic_planner = HeuristicPlanner()
-        self.heuristic_grounder = SimpleHeuristicGrounder()
-        self.heuristic_verifier = SimpleVerifier()
-
-    def _save_annotated_image(self, base_img: Image.Image, boxes: List[List[int]], output_path: str):
-        annotated = base_img.copy()
-        draw = ImageDraw.Draw(annotated)
-        for i, box in enumerate(boxes):
-            draw.rectangle(box, outline="red", width=2)
-            draw.text((box[0] + 2, box[1] + 2), f"#{i}", fill="red")
-        annotated.save(output_path)
+        os.makedirs(self.detections_log_dir, exist_ok=True)
 
     def search(
         self,
@@ -76,52 +69,38 @@ class RecursiveVisualSearcher:
             
         print(f"\n============== [DEPTH {depth} - QWEN RESOLUTION: {w}x{h}] ==============")
         
-        # PHASE 1: PLANNING (QWEN)
-        try:
-            plan = self.planner.plan_icon_location(screenshot, instruction)
-            print(f"✓ Qwen Planner isolated target likelihood neighborhoods.")
-        except Exception as e:
-            print(f"⚠️ Qwen Planner Exception encountered: {e}")
-            traceback.print_exc()
-            plan = self.heuristic_planner.plan_icon_location(screenshot, instruction)
+        # PHASE 1: PLANNING
+        plan = self.planner.plan_icon_location(screenshot, instruction)
+        print(f"✓ Planner isolated target likelihood neighborhoods.")
             
         candidate_regions = plan["likely_regions"]
         
-        planner_img_path = os.path.join(self.planner_log_dir, f"depth_{depth}_regions.png")
-        self._save_annotated_image(screenshot, candidate_regions, planner_img_path)
+        planner_img_path = os.path.join(self.planner_log_dir, f"{self.run_timestamp}_depth_{depth}_regions.png")
+        save_annotated_image(screenshot, candidate_regions, planner_img_path)
         
-        # PHASE 2: GROUNDING (QWEN)
-        try:
-            grounding = self.grounder.ground_icon_in_regions(screenshot, candidate_regions, instruction)
-            print(f"✓ Qwen Grounder extracted precise spatial voting frames.")
-        except Exception as e:
-            print(f"⚠️ Qwen Grounder Exception encountered: {e}")
-            traceback.print_exc()
-            grounding = self.heuristic_grounder.ground_icon_in_regions(screenshot, candidate_regions, instruction)
+        # PHASE 2: GROUNDING
+        grounding = self.grounder.ground_icon_in_regions(screenshot, candidate_regions, instruction)
+        print(f"✓ Grounder extracted precise spatial voting frames.")
             
         voting_boxes = grounding["voting_boxes"]
         
-        grounder_img_path = os.path.join(self.grounder_log_dir, f"depth_{depth}_voting_boxes.png")
-        self._save_annotated_image(screenshot, [vb["box"] for vb in voting_boxes], grounder_img_path)
+        grounder_img_path = os.path.join(self.grounder_log_dir, f"{self.run_timestamp}_depth_{depth}_voting_boxes.png")
+        save_annotated_image(screenshot, [vb["box"] for vb in voting_boxes], grounder_img_path)
         
         # PHASE 3: SCORING (GAUSSIAN CENTRALITY)
         best_idx, best_score, best_region = get_best_region(voting_boxes, candidate_regions, sigma=0.3, use_nms=True)
         print(f"--> Ranked Region #{best_idx} best with density score: {best_score:.3f}")
         
         rx1, ry1, rx2, ry2 = best_region
-        local_cx = (rx1 + rx2) // 2
-        local_cy = (ry1 + ry2) // 2
+        # Resolve exact click point using the Grounder's most confident vote within the region
+        local_cx, local_cy = get_best_voting_box_center(voting_boxes, best_region, sigma=0.3)
         
         # Extract the focused crop sub-canvas
         cropped_patch = screenshot.crop((rx1, ry1, rx2, ry2))
         
-        # PHASE 4: VERIFICATION (QWEN)
-        try:
-            is_target, refined_instr = self.verifier.verify_target(cropped_patch, instruction)
-            print(f"✓ Qwen Verification completed. target_match status: {is_target}")
-        except Exception as e:
-            print(f"⚠️ Qwen Verifier exception: {e}")
-            is_target, refined_instr = self.heuristic_verifier.verify_target(cropped_patch, instruction)
+        # PHASE 4: VERIFICATION
+        is_target, refined_instr = self.verifier.verify_target(cropped_patch, instruction)
+        print(f"✓ Verification completed. target_match status: {is_target}")
             
         # Reconstruct tracking matrix up to true display space coordinates
         global_x = local_cx
@@ -141,6 +120,17 @@ class RecursiveVisualSearcher:
         combined_confidence = (plan["confidence"] + grounding["overall_confidence"]) / 2
         if is_target and combined_confidence >= self.confidence_threshold:
             print(f"🎯 Target confirmed at Location Hook: ({global_x}, {global_y})")
+            # Save rich annotated screenshot for submission deliverable
+            if depth == 0:  # Only annotate the full-resolution screenshot
+                save_detection_screenshot(
+                    screenshot=screenshot,
+                    center=(global_x, global_y),
+                    bounding_box=tuple(global_box),
+                    confidence=combined_confidence,
+                    run_timestamp=self.run_timestamp,
+                    output_dir=self.detections_log_dir,
+                    label=instruction.split()[-1]  # last word = app name
+                )
             return SearchResult(True, (global_x, global_y), combined_confidence, tuple(global_box), depth, "Target found and verified by Qwen engine.")
             
         print(f"📉 Low match confidence or verification flagged false. Processing deeper recursion search tier...")

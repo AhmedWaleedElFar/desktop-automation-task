@@ -24,6 +24,7 @@ class QwenVerifier:
     
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
+        self.model = os.getenv("OPENROUTER_MODEL", "qwen/qwen-2.5-vl-72b-instruct")
         if OPENAI_AVAILABLE and self.api_key:
             self.client = openai.OpenAI(
                 base_url="https://openrouter.ai/api/v1",
@@ -62,7 +63,7 @@ Required JSON Structure:
         img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
         response = self.client.chat.completions.create(
-            model="qwen/qwen-2.5-vl-72b-instruct",
+            model=self.model,
             messages=[
                 {
                     "role": "user",
@@ -129,11 +130,11 @@ if __name__ == "__main__":
         exit(1)
     
     # Create a test crop (assume we found something in top-left)
-    print("\n[2/2] Testing Gemini Verifier...")
+    print("\n[2/2] Testing Qwen Verifier...")
     crop = screenshot.crop((20, 240, 90, 320))
     
     try:
-        verifier = GeminiVerifier()
+        verifier = QwenVerifier()
         is_target, new_instr = verifier.verify_target(crop, "Notepad application icon")
         
         print(f"\n✓ Verification Result:")
@@ -144,7 +145,7 @@ if __name__ == "__main__":
         print(f"\n✅ Verifier test passed!")
     
     except Exception as e:
-        print(f"\n❌ Gemini verifier failed: {e}")
+        print(f"\n❌ Qwen verifier failed: {e}")
         print("  Trying heuristic verifier...")
         
         verifier = SimpleVerifier()

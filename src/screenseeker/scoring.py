@@ -214,6 +214,53 @@ def get_best_region(
     return best_idx, best_score, best_region
 
 
+def get_best_voting_box_center(
+    voting_boxes: List[Dict],
+    winning_region: List[int],
+    sigma: float = 0.3
+) -> Tuple[int, int]:
+    """
+    Find the specific voting box that is most centrally aligned with the winning region.
+    Returns the (cx, cy) coordinates of that specific Grounder box, NOT the Planner's region center.
+    """
+    x1, y1, x2, y2 = winning_region
+    default_center = ((x1 + x2) // 2, (y1 + y2) // 2)
+    
+    if not voting_boxes:
+        return default_center
+        
+    region_w = max(1, x2 - x1)
+    region_h = max(1, y2 - y1)
+    
+    best_score = -1.0
+    best_center = default_center
+    
+    for box_data in voting_boxes:
+        box = box_data["box"]
+        confidence = box_data.get("confidence", 1.0)
+        
+        bx1, by1, bx2, by2 = box
+        cx = int((bx1 + bx2) / 2)
+        cy = int((by1 + by2) / 2)
+        
+        # Calculate how much this specific box contributed to the region's score
+        x_norm = (cx - x1) / region_w
+        y_norm = (cy - y1) / region_h
+        
+        # Ignore boxes completely outside the candidate region
+        if x_norm < 0 or x_norm > 1 or y_norm < 0 or y_norm > 1:
+            continue
+            
+        dist_sq = (x_norm - 0.5)**2 + (y_norm - 0.5)**2
+        gaussian = math.exp(-2 * sigma**2 * dist_sq)
+        score = gaussian * confidence
+        
+        if score > best_score:
+            best_score = score
+            best_center = (cx, cy)
+            
+    return best_center
+
 # ============================================================================
 # TESTING
 # ============================================================================

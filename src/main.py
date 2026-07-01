@@ -74,7 +74,7 @@ def run_search_test():
     print("=" * 80)
     
     try:
-        from recursive_search import RecursiveVisualSearcher
+        from screenseeker.recursive_search import RecursiveVisualSearcher
         from screenshot import take_screenshot
         
         print("\n[1/2] Capturing screenshot...")
@@ -136,13 +136,13 @@ def run_automation(num_posts: int = 10):
             print("\nCancelled by user")
             return False
         
-        # Try Claude first, fallback to heuristics
+        # Try VLMs first, fallback to heuristics
         try:
             automaton = DesktopAutomation()
-            print("Using Claude API for grounding")
+            print("Using Vision Language Models for grounding")
         except:
-            print("Claude API unavailable, using heuristics")
-            automaton = DesktopAutomation(use_gemini=False)
+            print("VLM API unavailable, using heuristics")
+            automaton = DesktopAutomation(use_vlm=False)
         
         stats = automaton.run_full_automation(num_posts=num_posts)
         

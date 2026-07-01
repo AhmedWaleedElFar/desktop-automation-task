@@ -50,7 +50,7 @@ class OpenRouterGrounder:
         )
         
         # Best visual grounding model option
-        self.model = "qwen/qwen-2.5-vl-72b-instruct"
+        self.model = os.getenv("OPENROUTER_MODEL", "qwen/qwen-2.5-vl-72b-instruct")
     
     def _image_to_base64_data_uri(self, image: Image.Image) -> str:
         """Convert PIL Image to a base64 Data URI."""
@@ -183,10 +183,10 @@ class OpenRouterGrounder:
 class SimpleHeuristicGrounder:
     """Fallback heuristic grounder (no API needed)."""
     @staticmethod
-    def ground_icon_in_regions(screenshot: Image.Image, candidate_regions: List[List[int]], target_app: str) -> Optional[Dict]:
-        if not candidate_regions:
-            return None
-        x1, y1, x2, y2 = candidate_regions[0]
+    def ground_icon_in_regions(screenshot: Image.Image, candidate_regions: List[List[int]], target_app: str) -> Dict:
+        width, height = screenshot.size
+        regions_to_use = candidate_regions if candidate_regions else [[0, 0, width, height]]
+        x1, y1, x2, y2 = regions_to_use[0]
         center_x = (x1 + x2) // 2
         center_y = (y1 + y2) // 2
         return {
@@ -203,7 +203,7 @@ class SimpleHeuristicGrounder:
 
 if __name__ == "__main__":
     from screenshot import take_screenshot
-    from planner import GeminiPlanner, HeuristicPlanner
+    from planner import QwenPlanner, HeuristicPlanner
     
     print("=" * 70)
     print("GROUNDER TEST - Qwen API with Voting Mechanism")
@@ -221,12 +221,12 @@ if __name__ == "__main__":
     # Step 2: Planning phase
     print("\n[2/3] Planning phase...")
     try:
-        planner = GeminiPlanner()
+        planner = QwenPlanner()
         plan = planner.plan_icon_location(screenshot, target_app="Notepad")
         regions = plan["likely_regions"]
         print(f"      Got {len(regions)} candidate regions")
     except Exception as e:
-        print(f"      Gemini planner failed: {e}")
+        print(f"      Qwen planner failed: {e}")
         print("      Using heuristic planning...")
         planner = HeuristicPlanner()
         plan = planner.plan_icon_location(screenshot, target_app="Notepad")

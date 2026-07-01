@@ -24,6 +24,7 @@ class QwenPlanner:
     
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
+        self.model = os.getenv("OPENROUTER_MODEL", "qwen/qwen-2.5-vl-72b-instruct")
         if OPENAI_AVAILABLE and self.api_key:
             self.client = openai.OpenAI(
                 base_url="https://openrouter.ai/api/v1",
@@ -65,7 +66,7 @@ Required JSON Structure:
         img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
         response = self.client.chat.completions.create(
-            model="qwen/qwen-2.5-vl-72b-instruct",
+            model=self.model,
             messages=[
                 {
                     "role": "user",
@@ -155,7 +156,7 @@ if __name__ == "__main__":
     from screenshot import take_screenshot
     
     print("=" * 70)
-    print("PLANNER TEST - Gemini 2.5 Flash API")
+    print("PLANNER TEST - Qwen2.5-VL API")
     print("=" * 70)
     
     # Capture a screenshot
@@ -167,13 +168,13 @@ if __name__ == "__main__":
         print(f"      Error capturing screenshot: {e}")
         exit(1)
     
-    # Test Gemini planner
-    print("\n[2/2] Testing Gemini Planner...")
+    # Test Qwen planner
+    print("\n[2/2] Testing Qwen Planner...")
     try:
-        planner = GeminiPlanner()
+        planner = QwenPlanner()
         result = planner.plan_icon_location(img, target_app="Notepad")
         
-        print("\n✓ Gemini Planner Result:")
+        print("\n✓ Qwen Planner Result:")
         print(f"  Reasoning: {result['reasoning']}")
         print(f"  Predicted Center: {result['predicted_center']}")
         print(f"  Confidence: {result['confidence']:.0%}")
@@ -188,7 +189,7 @@ if __name__ == "__main__":
         
         print("\n✓ Planner test passed!")
     except Exception as e:
-        print(f"\n✗ Gemini Planner failed: {e}")
+        print(f"\n✗ Qwen Planner failed: {e}")
         print("  Falling back to Heuristic...")
         
         heuristic = HeuristicPlanner()
