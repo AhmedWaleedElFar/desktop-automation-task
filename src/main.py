@@ -83,15 +83,27 @@ def run_search_test():
         
         print("\n[2/2] Running recursive search...")
         
-        # Try Gemini first, fallback to heuristics
+        from screenseeker.planner import QwenPlanner, HeuristicPlanner
+        from screenseeker.grounder import OpenRouterGrounder, SimpleHeuristicGrounder
+        from screenseeker.verifier import QwenVerifier, SimpleVerifier
+
+        # Try VLM first, fallback to heuristics
         try:
-            searcher = RecursiveVisualSearcher()
-            print("      Using Gemini API")
+            searcher = RecursiveVisualSearcher(
+                planner=QwenPlanner(),
+                grounder=OpenRouterGrounder(),
+                verifier=QwenVerifier()
+            )
+            print("      Using VLM API")
         except:
-            print("      Gemini API unavailable, using heuristics")
-            searcher = RecursiveVisualSearcher()
+            print("      VLM API unavailable, using heuristics")
+            searcher = RecursiveVisualSearcher(
+                planner=HeuristicPlanner(),
+                grounder=SimpleHeuristicGrounder(),
+                verifier=SimpleVerifier()
+            )
         
-        result = searcher.search(screenshot, "Notepad")
+        result = searcher.search(screenshot, "This PC")
         
         print(f"\n{'='*80}")
         print("SEARCH RESULT")
