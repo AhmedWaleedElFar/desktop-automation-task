@@ -166,14 +166,29 @@ if __name__ == "__main__":
     print("\n[2/2] Running recursive visual search...")
     
     try:
-        # Use gemini if available, otherwise fallback to heuristics
+        from .planner import QwenPlanner, HeuristicPlanner
+        from .grounder import OpenRouterGrounder, SimpleHeuristicGrounder
+        from .verifier import QwenVerifier, SimpleVerifier
+
+        try:
+            planner = QwenPlanner()
+            grounder = OpenRouterGrounder()
+            verifier = QwenVerifier()
+        except:
+            planner = HeuristicPlanner()
+            grounder = SimpleHeuristicGrounder()
+            verifier = SimpleVerifier()
+
         searcher = RecursiveVisualSearcher(
+            planner=planner,
+            grounder=grounder,
+            verifier=verifier,
             max_depth=2,
             min_patch_size=1280,
             confidence_threshold=0.5
         )
         
-        result = searcher.search(screenshot, "Find the Notepad application icon")
+        result = searcher.search(screenshot, "This PC")
         
         print(f"\n{'='*70}")
         print(f"FINAL RESULT")
