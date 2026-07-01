@@ -50,7 +50,7 @@ class OpenRouterGrounder:
         )
         
         # Best visual grounding model option
-        self.model = "qwen/qwen-2.5-vl-72b-instruct"
+        self.model = os.getenv("OPENROUTER_MODEL", "qwen/qwen-2.5-vl-72b-instruct")
     
     def _image_to_base64_data_uri(self, image: Image.Image) -> str:
         """Convert PIL Image to a base64 Data URI."""
@@ -90,33 +90,30 @@ class OpenRouterGrounder:
             for i, (x1, y1, x2, y2) in enumerate(candidate_regions)
         ])
         
+        # Inside grounder.py (ground_icon_in_regions method)
+        width, height = screenshot.size
+
         prompt = f"""You are a pixel-level visual grounding assistant specializing in GUI automation.
-Your task is to locate the exact bounding box of the '{target_app}' application icon on this desktop (1920x1080 resolution).
+        Your task is to locate the exact bounding box of the '{target_app}' icon within this provided image patch.
+        The exact canvas resolution is {width}x{height} pixels.
 
-We have narrowed down the search area to these candidate regions:
-{region_descriptions}
+        We have narrowed down the search area to these candidate regions:
+        {region_descriptions}
 
-Task instructions:
-1. Scan the candidate regions in the provided image.
-2. Predict the exact coordinate bounding boxes [x1, y1, x2, y2] for the '{target_app}' icon if you see it.
-3. Supply multiple localized bounding boxes ("voting boxes") around the target to help rank and score candidates.
-4. Output your answer in the requested structured JSON layout.
+        Task instructions:
+        1. Scan the candidate regions in the provided image.
+        2. Predict the exact coordinate bounding boxes [x1, y1, x2, y2] relative to this image space.
+        3. Coordinates must strictly reside within pixel bounds (0 to {width} width, 0 to {height} height).
 
-Respond with ONLY raw, valid JSON conforming to this structure:
-{{
-    "reasoning": "Reasoning about icon detections in regions",
-    "voting_boxes": [
-        {{"box": [x1, y1, x2, y2], "confidence": 0.95, "region": 0}},
-        {{"box": [x1, y1, x2, y2], "confidence": 0.88, "region": 0}}
-    ],
-    "best_center": [x, y],
-    "overall_confidence": 0.92
-}}
-
-Notes:
-- Output only valid JSON. Do not write markdown blocks, "```json", or extra preamble text.
-- Coordinates must be within pixel bounds (1920 x 1080 resolution).
-- The "best_center" should be your single highest-likelihood click point [x, y]."""
+        Respond with ONLY raw, valid JSON conforming to this structure:
+        {{
+            "reasoning": "Reasoning about icon detections",
+            "voting_boxes": [
+                {{"box": [x1, y1, x2, y2], "confidence": 0.95, "region": 0}}
+            ],
+            "best_center": [x, y],
+            "overall_confidence": 0.92
+        }}"""
 
         try:
             response = self.client.chat.completions.create(
@@ -186,10 +183,10 @@ Notes:
 class SimpleHeuristicGrounder:
     """Fallback heuristic grounder (no API needed)."""
     @staticmethod
-    def ground_icon_in_regions(screenshot: Image.Image, candidate_regions: List[List[int]], target_app: str) -> Optional[Dict]:
-        if not candidate_regions:
-            return None
-        x1, y1, x2, y2 = candidate_regions[0]
+    def ground_icon_in_regions(screenshot: Image.Image, candidate_regions: List[List[int]], target_app: str) -> Dict:
+        width, height = screenshot.size
+        regions_to_use = candidate_regions if candidate_regions else [[0, 0, width, height]]
+        x1, y1, x2, y2 = regions_to_use[0]
         center_x = (x1 + x2) // 2
         center_y = (y1 + y2) // 2
         return {
@@ -206,7 +203,7 @@ class SimpleHeuristicGrounder:
 
 if __name__ == "__main__":
     from screenshot import take_screenshot
-    from planner import GeminiPlanner, HeuristicPlanner
+    from planner import QwenPlanner, HeuristicPlanner
     
     print("=" * 70)
     print("GROUNDER TEST - Qwen API with Voting Mechanism")
@@ -224,12 +221,12 @@ if __name__ == "__main__":
     # Step 2: Planning phase
     print("\n[2/3] Planning phase...")
     try:
-        planner = GeminiPlanner()
+        planner = QwenPlanner()
         plan = planner.plan_icon_location(screenshot, target_app="Notepad")
         regions = plan["likely_regions"]
         print(f"      Got {len(regions)} candidate regions")
     except Exception as e:
-        print(f"      Gemini planner failed: {e}")
+        print(f"      Qwen planner failed: {e}")
         print("      Using heuristic planning...")
         planner = HeuristicPlanner()
         plan = planner.plan_icon_location(screenshot, target_app="Notepad")
